@@ -34,7 +34,9 @@ async function lookupEAN(ean) {
     const j = await r.json();
     if (j.status === 1 && j.product) {
       const name = j.product.product_name_cs || j.product.product_name || "";
-      const brand = (j.product.brands || "").split(",")[0]?.trim();
+      // Poslední značka bývá konkrétnější (např. "Kofola, Rajec" → "Rajec").
+      const brands = (j.product.brands || "").split(",").map((s) => s.trim()).filter(Boolean);
+      const brand = brands[brands.length - 1];
       return [brand, name].filter(Boolean).join(" ").trim() || null;
     }
   } catch (e) { /* offline / not found */ }
