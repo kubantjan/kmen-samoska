@@ -223,7 +223,7 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
         <div style={{ flex: 1 }}>
           <label style={S.label}>Kusů</label>
           <input style={S.input} type="number" min="1" value={draft.qty}
-            onChange={(e) => setDraft({ ...draft, qty: Number(e.target.value) })} />
+            onChange={(e) => setDraft({ ...draft, qty: e.target.value })} />
         </div>
         <div style={{ flex: 1 }}>
           <label style={S.label}>Cena za kus</label>
