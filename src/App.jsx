@@ -266,6 +266,18 @@ export default function App() {
     await supabase.from("members").delete().eq("name", name);
     await refetch();
   }
+  // Přejmenování. Jméno je identita (klíč členů i `by` u šarží/ledgeru), takže
+  // přepíšeme i historii, jinak by člověk přišel o saldo. Není to atomické, ale
+  // u téhle velikosti to stačí. Kolizi s existujícím jménem hlídá UI.
+  async function renameMember(oldName, newName) {
+    const n = (newName || "").trim();
+    if (!n || n === oldName || members.some((m) => m.name === n)) return;
+    await supabase.from("batches").update({ by: n }).eq("by", oldName);
+    await supabase.from("ledger").update({ by: n }).eq("by", oldName);
+    await supabase.from("members").update({ name: n }).eq("name", oldName);
+    if (me === oldName) setMe(n);
+    await refetch();
+  }
 
   if (!me) return <NamePicker members={activeMembers} onPick={setMe} />;
 
@@ -297,7 +309,7 @@ export default function App() {
         {tab === "balance" && <Balance balances={visibleBalances} suggestion={suggestion} me={me} names={activeNames} onPay={recordPayment} />}
         {tab === "hist" && <History batches={batches} ledger={ledger} products={products} />}
         {tab === "inv" && <Inventura stock={stock} balances={balances} listMembers={activeMembers} splitCount={splitNames.length} onStock={addBatch} onCommit={commitInventura} />}
-        {tab === "people" && <People members={members} balances={balances} activeSet={activeSet} me={me} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} />}
+        {tab === "people" && <People members={members} balances={balances} activeSet={activeSet} me={me} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} onRename={renameMember} />}
       </main>
 
       <footer style={S.footer}>
@@ -947,9 +959,11 @@ function PayForm({ pay, setPay, onSubmit, onCancel, busy, names }) {
 // ── Správa lidí ─────────────────────────────────────────────
 // Členové, hosté (viditelní, ale nedělí se s nimi manko) a skrytí/bývalí
 // (archivovaní k dnešku — už nefigurují, historie zůstává).
-function People({ members, balances, activeSet, me, onAdd, onUpdate, onDelete }) {
+function People({ members, balances, activeSet, me, onAdd, onUpdate, onDelete, onRename }) {
   const [name, setName] = useState("");
   const [guest, setGuest] = useState(false);
+  const [editing, setEditing] = useState(null); // jméno člena, který se právě přejmenovává
+  const [editVal, setEditVal] = useState("");
 
   const balOf = Object.fromEntries(balances.map((b) => [b.name, b.amount]));
   const sorted = sortMembers(members);
@@ -978,10 +992,38 @@ function People({ members, balances, activeSet, me, onAdd, onUpdate, onDelete })
     if (window.confirm(`Nadobro smazat ${m.name}? Nemá žádnou historii, takže po něm nic nezůstane.`)) onDelete(m.name);
   }
 
+  function startEdit(m) { setEditVal(m.name); setEditing(m.name); }
+  function saveEdit(m) {
+    const n = editVal.trim();
+    if (!n || n === m.name) { setEditing(null); return; }
+    if (members.some((x) => x.name !== m.name && x.name.toLowerCase() === n.toLowerCase())) {
+      alert("Někdo s tímhle jménem už tu je.");
+      return;
+    }
+    onRename(m.name, n); // přepíše i historii (šarže/ledger), aby sedělo saldo
+    setEditing(null);
+  }
+
   function row(m, { restore } = {}) {
     const bal = balOf[m.name] || 0;
     const nonzero = Math.abs(bal) >= 0.005;
     const hasHist = activeSet.has(m.name);
+    if (editing === m.name) {
+      return (
+        <div key={m.name} style={S.peopleRow}>
+          <input
+            style={S.input} value={editVal} autoFocus
+            onChange={(e) => setEditVal(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") saveEdit(m); if (e.key === "Escape") setEditing(null); }}
+          />
+          {hasHist && <p style={S.peopleEditNote}>Přejmenování přepíše i historii ({m.name}), saldo zůstane.</p>}
+          <div style={S.peopleActions}>
+            <button style={{ ...S.peopleBtn, ...S.peopleBtnPrimary }} onClick={() => saveEdit(m)}>Uložit</button>
+            <button style={S.peopleBtn} onClick={() => setEditing(null)}>Zrušit</button>
+          </div>
+        </div>
+      );
+    }
     return (
       <div key={m.name} style={S.peopleRow}>
         <div style={S.peopleMain}>
@@ -994,6 +1036,7 @@ function People({ members, balances, activeSet, me, onAdd, onUpdate, onDelete })
           </span>
         </div>
         <div style={S.peopleActions}>
+          <button style={S.peopleBtn} onClick={() => startEdit(m)}>Přejmenovat</button>
           {restore ? (
             <>
               <button style={S.peopleBtn} onClick={() => onUpdate(m.name, { archived: false })}>Vrátit</button>
@@ -1270,6 +1313,8 @@ const S = {
   peopleActions: { display: "flex", gap: 8, flexWrap: "wrap" },
   peopleBtn: { background: "#fff", color: "var(--brand-ink)", border: "1px solid var(--line)", borderRadius: 9, padding: "7px 12px", fontSize: 13, fontWeight: 600 },
   peopleBtnDanger: { color: "var(--neg)" },
+  peopleBtnPrimary: { background: "var(--brand)", color: "#fff", borderColor: "var(--brand)" },
+  peopleEditNote: { fontSize: 12, color: "var(--sub)", margin: "2px 0 0", lineHeight: 1.4 },
 
   scanOverlay: { position: "fixed", inset: 0, background: "rgba(20,18,14,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 },
 
