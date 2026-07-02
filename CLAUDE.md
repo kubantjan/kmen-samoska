@@ -25,8 +25,16 @@ Model je společný měšec (jako SettleUp):
 
 - Vite + React 18 (jediná komponenta v `src/App.jsx`, styly inline)
 - `@zxing/browser` na čtení čárových kódů
-- Data zatím v `localStorage` (klíče `samoska.*`) — **žádný backend**,
-  stav je lokální v každém telefonu. Sdílený stav mezi lidmi je další krok.
+- **Sdílená DB: Supabase (Postgres).** Tabulky `products`, `batches`
+  (sloupec `remaining` = v appce `left`), `ledger`. Realtime subscribe →
+  změny se propíšou všem. FIFO odběr přes RPC `take_item` (atomicky).
+  Klíče v `.env` (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`).
+- **Auth: jeden sdílený login** (Supabase Auth, `signInWithPassword`).
+  Email v `.env` (`VITE_SUPABASE_LOGIN_EMAIL`), heslo píše uživatel.
+  RLS je jen pro `authenticated` — viz `db/auth-rls.sql`. Identita
+  ("kdo jsem") zůstává lokální (klik na jméno, `localStorage`).
+- **Ceny z Rohlíku** — `searchRohlik()` volá neoficiální endpoint
+  (posílá CORS `*`), hledá podle názvu, doplní název + orientační cenu.
 - Deploy: GitHub Pages přes Actions (`.github/workflows/deploy.yml`)
 
 ## Než nasadíš
@@ -40,13 +48,14 @@ Model je společný měšec (jako SettleUp):
 
 ## Kam appku posunout dál (backlog)
 
-- **Sdílený backend** — hlavní věc. Aby všech 11 lidí vidělo stejný stav.
-  Zvažovaný stack: .NET minimal API + Postgres (konzistentní s hlavním
-  produktem), nebo něco lehčího. Datový model: members, products (ean+název),
-  stock_batches (produkt, kdo, qty, left, price, at), purchases (kdo, produkt,
-  šarže, cena). Salda = suma naskladnění − suma odběrů per člověk.
-- Odběr více kusů naráz (teď 1 klik = 1 kus).
 - Editace/smazání omylem zadané položky.
 - Historie transakcí.
 - Záporný sklad / došlé zboží (co když si někdo vezme něco, co "není"?).
-- Přihlašování (teď se jen klikne jméno).
+- Účty per člověk (magic link) místo jednoho sdíleného hesla — až pro
+  ostrý provoz (viz varianta B v issue #1).
+
+## Hotovo (dřív v backlogu)
+
+- Sdílený backend → **Supabase** (viz Stack).
+- Odběr více kusů naráz → počítadlo v potvrzovacím okně.
+- Přihlašování → sdílený login (viz Stack + `db/auth-rls.sql`).
