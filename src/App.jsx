@@ -51,25 +51,27 @@ async function lookupEAN(ean) {
   return null;
 }
 
-// ── Rohlík — aktuální cena podle názvu (jen orientační) ─────
+// ── Rohlík — vyhledávání podle názvu (název + orientační cena) ──
 // Neoficiální endpoint, ale posílá CORS `*`, takže jde volat z prohlížeče.
-async function lookupRohlik(query) {
+async function searchRohlik(query, limit = 6) {
   const q = (query || "").trim();
-  if (q.length < 2) return null;
+  if (q.length < 2) return [];
   try {
     const r = await fetch(
       `https://www.rohlik.cz/services/frontend-service/search-metadata?search=${encodeURIComponent(q)}&companyId=1`
     );
     const j = await r.json();
-    const p = j?.data?.productList?.[0];
-    if (!p || p.price?.full == null) return null;
-    return {
-      name: p.productName,
-      price: p.price.full,
-      amount: p.textualAmount || "",
-      link: p.baseLink ? `https://www.rohlik.cz/${p.baseLink}` : null,
-    };
-  } catch { return null; }
+    const list = j?.data?.productList || [];
+    return list
+      .map((p) => ({
+        id: p.productId,
+        name: p.productName,
+        price: p.price?.full ?? null,
+        amount: p.textualAmount || "",
+      }))
+      .filter((x) => x.price != null)
+      .slice(0, limit);
+  } catch { return []; }
 }
 
 export default function App() {
@@ -138,12 +140,15 @@ export default function App() {
   }
 
   // FIFO odběr atomicky na serveru (RPC take_item) — dva lidi naráz
-  // nerozbijí `remaining` ani nevezmou stejný kus dvakrát.
-  async function take(ean) {
-    const { error } = await supabase.rpc("take_item", {
-      p_ean: ean, p_by: me, p_id: crypto.randomUUID(), p_at: Date.now(),
-    });
-    if (error) alert("Nepovedlo se vzít: " + error.message);
+  // nerozbijí `remaining` ani nevezmou stejný kus dvakrát. Víc kusů =
+  // víc volání za sebou, každé sebere nejstarší dostupný kus.
+  async function take(ean, count = 1) {
+    for (let i = 0; i < count; i++) {
+      const { error } = await supabase.rpc("take_item", {
+        p_ean: ean, p_by: me, p_id: crypto.randomUUID(), p_at: Date.now(),
+      });
+      if (error) { alert("Nepovedlo se vzít: " + error.message); break; }
+    }
     refetch();
   }
 
@@ -211,8 +216,9 @@ function Shop({ stock, onStock, onTake }) {
   const filtered = q.trim() ? stock.filter((s) => norm(s.name).includes(norm(q))) : stock;
 
   function openTake(s) {
-    const next = s.batches.slice().sort((a, b) => a.at - b.at)[0];
-    setTakeItem({ ean: s.ean, name: s.name, price: next.price, qty: s.qty });
+    // šarže od nejstarší (FIFO) — kvůli přesné ceně při odběru víc kusů
+    const batches = s.batches.slice().sort((a, b) => a.at - b.at).map((b) => ({ left: b.left, price: b.price }));
+    setTakeItem({ ean: s.ean, name: s.name, qty: s.qty, batches });
   }
 
   function onScanned(ean) {
@@ -289,7 +295,7 @@ function Shop({ stock, onStock, onTake }) {
       {takeItem && (
         <ConfirmTake
           item={takeItem}
-          onConfirm={() => { onTake(takeItem.ean); setTakeItem(null); }}
+          onConfirm={(n) => { onTake(takeItem.ean, n); setTakeItem(null); }}
           onCancel={() => setTakeItem(null)}
         />
       )}
@@ -299,28 +305,56 @@ function Shop({ stock, onStock, onTake }) {
 
 function StockForm({ draft, setDraft, onSave, onCancel }) {
   const valid = draft.name.trim() && Number(draft.price) > 0 && Number(draft.qty) > 0;
-  const [rohlik, setRohlik] = useState(null);
+  const [rohlik, setRohlik] = useState([]);        // výsledky hledání
   const [rohlikLoading, setRohlikLoading] = useState(false);
+  const [picked, setPicked] = useState(false);      // po výběru schovat seznam
 
-  // Dotáhni orientační cenu z Rohlíku podle názvu (s malým zpožděním).
+  // Hledej na Rohlíku podle názvu (s malým zpožděním). Po výběru se nehledá.
   useEffect(() => {
+    if (picked) return;
     const q = draft.name.trim();
-    if (q.length < 2) { setRohlik(null); setRohlikLoading(false); return; }
+    if (q.length < 2) { setRohlik([]); setRohlikLoading(false); return; }
     let live = true;
     setRohlikLoading(true);
     const t = setTimeout(() => {
-      lookupRohlik(q).then((r) => { if (live) { setRohlik(r); setRohlikLoading(false); } });
+      searchRohlik(q).then((rs) => { if (live) { setRohlik(rs); setRohlikLoading(false); } });
     }, 500);
     return () => { live = false; clearTimeout(t); };
-  }, [draft.name]);
+  }, [draft.name, picked]);
+
+  function setName(v) { setPicked(false); setDraft({ ...draft, name: v }); }
+  function pick(r) {
+    setDraft({ ...draft, name: r.name, price: String(r.price) });
+    setPicked(true);
+    setRohlik([]);
+  }
 
   return (
     <section style={{ ...S.card, ...S.cardActive }}>
       <div style={S.cardTitle}>Naskladnění</div>
       {draft.ean && <div style={S.eanTag}>EAN {draft.ean}</div>}
-      <label style={S.label}>Název</label>
+      <label style={S.label}>Název — piš a vyber z Rohlíku (doplní název i cenu)</label>
       <input style={S.input} value={draft.name} placeholder="Kečup Heinz 500g"
-        onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
+        onChange={(e) => setName(e.target.value)} />
+
+      {!picked && rohlikLoading && rohlik.length === 0 && (
+        <div style={S.rohlikMuted}>Hledám na Rohlíku…</div>
+      )}
+      {!picked && rohlik.length > 0 && (
+        <div style={S.rohlik}>
+          <div style={S.rohlikHead}>
+            <span style={S.rohlikTag}>ROHLÍK</span> klepni a doplní se název i cena
+          </div>
+          {rohlik.map((r) => (
+            <button type="button" key={r.id} style={S.rohlikRow} onClick={() => pick(r)}>
+              <span style={S.rohlikRowName}>{r.name}{r.amount ? ` · ${r.amount}` : ""}</span>
+              <span style={S.rohlikRowPrice}>{KC(r.price)}</span>
+            </button>
+          ))}
+          <div style={S.rohlikNote}>Cena je orientační (za balení na Rohlíku) — po výběru ji můžeš přepsat.</div>
+        </div>
+      )}
+
       <div style={{ display: "flex", gap: 12 }}>
         <div style={{ flex: 1 }}>
           <label style={S.label}>Kusů</label>
@@ -333,24 +367,6 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
             onChange={(e) => setDraft({ ...draft, price: e.target.value })} />
         </div>
       </div>
-
-      {rohlikLoading && !rohlik && <div style={S.rohlikMuted}>Hledám cenu na Rohlíku…</div>}
-      {rohlik && (
-        <div style={S.rohlik}>
-          <div style={S.rohlikTop}>
-            <span style={S.rohlikTag}>ROHLÍK</span>
-            <span style={S.rohlikName}>{rohlik.name}{rohlik.amount ? ` · ${rohlik.amount}` : ""}</span>
-          </div>
-          <div style={S.rohlikBottom}>
-            <span style={S.rohlikPrice}>{KC(rohlik.price)}</span>
-            <button type="button" style={S.rohlikUse}
-              onClick={() => setDraft({ ...draft, price: String(rohlik.price) })}>
-              Použít cenu
-            </button>
-          </div>
-          <div style={S.rohlikNote}>Orientační — cena, za kterou jsi to koupil, může být jiná.</div>
-        </div>
-      )}
 
       <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
         <button style={{ ...S.primary, opacity: valid ? 1 : 0.4 }} disabled={!valid}
@@ -453,21 +469,48 @@ function Balance({ balances, suggestion, me }) {
 
 // ── Potvrzení odběru ────────────────────────────────────────
 function ConfirmTake({ item, onConfirm, onCancel }) {
-  const pricey = item.price >= 500;
+  const [n, setN] = useState(1);
+  const max = item.qty;
+
+  // Přesná cena za n kusů — postupně z nejstarších šarží (FIFO).
+  const total = useMemo(() => {
+    let left = n, sum = 0;
+    for (const b of item.batches) {
+      if (left <= 0) break;
+      const t = Math.min(left, b.left);
+      sum += t * b.price;
+      left -= t;
+    }
+    return sum;
+  }, [n, item.batches]);
+
+  const pricey = total >= 500;
+  const clamp = (x) => Math.max(1, Math.min(max, x));
+
   return (
     <div style={S.scanOverlay} onClick={onCancel}>
       <div style={S.confirmBox} onClick={(e) => e.stopPropagation()}>
         <div style={S.confirmKicker}>BEREŠ ZE SAMOŠKY</div>
         <div style={S.confirmName}>{item.name}</div>
+
+        <div style={S.stepRow}>
+          <button style={S.stepBtn} onClick={() => setN((x) => clamp(x - 1))} disabled={n <= 1}>−</button>
+          <div style={S.stepVal}>{n}<span style={S.stepUnit}>×</span></div>
+          <button style={S.stepBtn} onClick={() => setN((x) => clamp(x + 1))} disabled={n >= max}>+</button>
+          <button style={S.stepMax} onClick={() => setN(max)}>vše ({max})</button>
+        </div>
+
         <div style={{ ...S.confirmPrice, color: pricey ? "var(--neg)" : "var(--brand-ink)" }}>
-          {KC(item.price)}
+          {KC(total)}
         </div>
         <div style={S.confirmMeta}>
-          Zaplatíš cenu nejstarší šarže (FIFO) · skladem {item.qty}×
-          {pricey && <div style={S.confirmWarn}>⚠️ Dražší položka — zkontroluj, že si bereš tohle.</div>}
+          Cena z nejstarších šarží (FIFO) · skladem {max}×
+          {pricey && <div style={S.confirmWarn}>⚠️ Dražší nákup — zkontroluj, že bereš tohle.</div>}
         </div>
         <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-          <button style={{ ...S.primary, flex: 1 }} onClick={onConfirm}>Vzít za {KC(item.price)}</button>
+          <button style={{ ...S.primary, flex: 1 }} onClick={() => onConfirm(n)}>
+            Vzít {n}× za {KC(total)}
+          </button>
           <button style={S.ghost} onClick={onCancel}>Zrušit</button>
         </div>
       </div>
@@ -608,15 +651,20 @@ const S = {
   confirmMeta: { fontSize: 13, color: "var(--sub)", marginTop: 10, lineHeight: 1.5 },
   confirmWarn: { color: "var(--neg)", fontWeight: 700, marginTop: 8 },
 
-  rohlikMuted: { fontFamily: mono, fontSize: 12, color: "var(--sub)", marginTop: 12 },
-  rohlik: { marginTop: 12, background: "#fff", border: "1px solid var(--line)", borderRadius: 12, padding: "11px 12px" },
-  rohlikTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  stepRow: { display: "flex", alignItems: "center", gap: 10, margin: "14px 0 12px" },
+  stepBtn: { width: 46, height: 46, borderRadius: 12, border: "1px solid var(--line)", background: "#fff", fontSize: 24, fontWeight: 700, color: "var(--ink)", lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" },
+  stepVal: { minWidth: 56, textAlign: "center", fontFamily: mono, fontSize: 28, fontWeight: 800 },
+  stepUnit: { fontSize: 16, opacity: 0.55, marginLeft: 2 },
+  stepMax: { marginLeft: "auto", background: "none", border: "1px solid var(--line)", borderRadius: 10, padding: "9px 12px", fontSize: 13, fontWeight: 600, color: "var(--brand-ink)" },
+
+  rohlikMuted: { fontFamily: mono, fontSize: 12, color: "var(--sub)", margin: "10px 0" },
+  rohlik: { margin: "10px 0", background: "#fff", border: "1px solid var(--line)", borderRadius: 12, padding: "10px 10px 8px" },
+  rohlikHead: { display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--sub)", marginBottom: 8 },
   rohlikTag: { fontFamily: mono, fontSize: 10, fontWeight: 700, letterSpacing: 1, color: "#fff", background: "#00A56C", borderRadius: 5, padding: "2px 6px" },
-  rohlikName: { fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  rohlikBottom: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
-  rohlikPrice: { fontFamily: mono, fontSize: 18, fontWeight: 800, color: "var(--ink)" },
-  rohlikUse: { background: "#00A56C", color: "#fff", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 13, fontWeight: 700 },
-  rohlikNote: { fontSize: 11, color: "var(--sub)", marginTop: 8 },
+  rohlikRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, width: "100%", background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 9, padding: "10px 11px", marginBottom: 6, textAlign: "left" },
+  rohlikRowName: { fontSize: 13.5, fontWeight: 600, lineHeight: 1.3 },
+  rohlikRowPrice: { fontFamily: mono, fontSize: 14, fontWeight: 800, color: "#00794F", whiteSpace: "nowrap" },
+  rohlikNote: { fontSize: 11, color: "var(--sub)", marginTop: 4 },
 
   searchWrap: { position: "relative", display: "flex", alignItems: "center", marginBottom: 12 },
   searchIcon: { position: "absolute", left: 12, fontSize: 14, opacity: 0.6, pointerEvents: "none" },
