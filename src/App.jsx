@@ -26,6 +26,8 @@ const KC = (n) =>
 // Hledání bez ohledu na velikost písmen a diakritiku ("mleko" najde "Mléko").
 const norm = (s) => (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
 
+const DT = (at) => new Intl.DateTimeFormat("cs-CZ", { day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(at));
+
 // ── "kdo jsem" zůstává lokální v telefonu ───────────────────
 const load = (k, fallback) => {
   try { const v = localStorage.getItem("samoska." + k); return v ? JSON.parse(v) : fallback; }
@@ -194,7 +196,7 @@ export default function App() {
       </header>
 
       <nav style={S.tabs}>
-        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"], ["inv", "Inventura"]].map(([k, label]) => (
+        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"], ["hist", "Historie"], ["inv", "Inventura"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ ...S.tab, ...(tab === k ? S.tabOn : {}) }}>
             {label}
           </button>
@@ -205,6 +207,7 @@ export default function App() {
         {tab === "shop" && <Shop stock={stock} onStock={addBatch} onTake={take} />}
         {tab === "stock" && <Stock stock={stock} />}
         {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} />}
+        {tab === "hist" && <History batches={batches} ledger={ledger} products={products} />}
         {tab === "inv" && <Inventura stock={stock} balances={balances} onStock={addBatch} onCommit={commitInventura} />}
       </main>
 
@@ -463,6 +466,81 @@ function Stock({ stock }) {
           )}
         </div>
       ))}
+    </section>
+  );
+}
+
+function History({ batches, ledger, products }) {
+  const nameOf = (ean) => products[ean]?.name || ean;
+  const events = [];
+
+  for (const b of batches) {
+    const neutral = b.by === "__inventura__";
+    events.push({
+      at: b.at, kind: neutral ? "invadd" : "stock", who: b.by,
+      name: nameOf(b.ean), qty: b.qty, unit: b.price, amount: b.qty * b.price,
+    });
+  }
+
+  const grouped = {}; // seskup __manko__/__settleup__ podle času do jedné události
+  for (const l of ledger) {
+    if (l.ean === "__manko__" || l.ean === "__settleup__") {
+      const key = l.ean + "@" + l.at;
+      if (!grouped[key]) {
+        grouped[key] = { at: l.at, kind: l.ean === "__manko__" ? "manko" : "onboard", sum: 0, n: 0 };
+        events.push(grouped[key]);
+      }
+      grouped[key].sum += l.price; grouped[key].n++;
+    } else {
+      events.push({ at: l.at, kind: "take", who: l.by, name: nameOf(l.ean), amount: l.price });
+    }
+  }
+
+  events.sort((a, b) => b.at - a.at);
+
+  if (events.length === 0) {
+    return <section style={S.card}><div style={S.cardTitle}>Historie</div><p style={S.empty}>Zatím žádné transakce.</p></section>;
+  }
+
+  return (
+    <section style={S.card}>
+      <div style={S.cardTitle}>Historie transakcí</div>
+      <div style={S.histList}>
+        {events.map((e, i) => {
+          let icon, text, amount, color;
+          if (e.kind === "stock") {
+            icon = "＋"; color = "var(--pos)";
+            text = <><b>{e.who}</b> naskladnil {e.qty}× {e.name} <span style={S.histSub}>po {KC(e.unit)}</span></>;
+            amount = "+" + KC(e.amount);
+          } else if (e.kind === "invadd") {
+            icon = "📦"; color = "var(--sub)";
+            text = <>Inventura: přidáno {e.qty}× {e.name} <span style={S.histSub}>bez kupce</span></>;
+            amount = KC(e.amount);
+          } else if (e.kind === "take") {
+            icon = "−"; color = "var(--neg)";
+            text = <><b>{e.who}</b> vzal {e.name}</>;
+            amount = "−" + KC(e.amount);
+          } else if (e.kind === "manko") {
+            icon = "⚖"; color = e.sum >= 0 ? "var(--neg)" : "var(--pos)";
+            text = <>Inventura: {e.sum >= 0 ? "manko" : "přebytek"} rozpočítáno <span style={S.histSub}>({KC(Math.abs(e.sum / (e.n || 1)))}/os)</span></>;
+            amount = (e.sum >= 0 ? "−" : "+") + KC(Math.abs(e.sum));
+          } else { // onboard
+            icon = "⚙"; color = "var(--sub)";
+            text = <>Onboarding: nastavena počáteční salda <span style={S.histSub}>({e.n} členů)</span></>;
+            amount = "";
+          }
+          return (
+            <div key={i} style={S.histRow}>
+              <span style={{ ...S.histIcon, color }}>{icon}</span>
+              <div style={S.histMid}>
+                <div style={S.histText}>{text}</div>
+                <div style={S.histTime}>{DT(e.at)}</div>
+              </div>
+              {amount && <span style={{ ...S.histAmt, color }}>{amount}</span>}
+            </div>
+          );
+        })}
+      </div>
     </section>
   );
 }
@@ -831,6 +909,15 @@ const S = {
   segwrap: { display: "flex", gap: 4, background: "#fff", border: "1px solid var(--line)", borderRadius: 11, padding: 3, marginBottom: 10 },
   seg: { flex: 1, padding: "9px 8px", background: "none", border: "none", borderRadius: 9, fontSize: 13.5, fontWeight: 600, color: "var(--sub)" },
   segOn: { background: "var(--brand)", color: "#fff" },
+
+  histList: { display: "flex", flexDirection: "column" },
+  histRow: { display: "flex", alignItems: "center", gap: 11, padding: "10px 2px", borderTop: "1px solid var(--line)" },
+  histIcon: { fontSize: 16, fontWeight: 800, width: 22, textAlign: "center", flex: "0 0 auto" },
+  histMid: { flex: 1, minWidth: 0 },
+  histText: { fontSize: 14, lineHeight: 1.35 },
+  histSub: { color: "var(--sub)", fontSize: 12.5 },
+  histTime: { fontFamily: mono, fontSize: 11, color: "var(--sub)", marginTop: 2 },
+  histAmt: { fontFamily: mono, fontSize: 13.5, fontWeight: 700, whiteSpace: "nowrap", flex: "0 0 auto" },
 
   stockTotal: { fontFamily: mono, fontSize: 13, color: "var(--sub)", marginBottom: 12 },
   stockItem: { borderTop: "1px solid var(--line)", padding: "2px 0" },
