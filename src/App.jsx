@@ -131,10 +131,10 @@ export default function App() {
     return { from: bottom.name, to: top.name, amount: Math.min(-bottom.amount, top.amount) };
   }, [balances]);
 
-  async function addBatch(ean, name, qty, price) {
+  async function addBatch(ean, name, qty, price, by = me) {
     await supabase.from("products").upsert({ ean, name });
     await supabase.from("batches").insert({
-      id: crypto.randomUUID(), ean, by: me, qty, remaining: qty, price, at: Date.now(),
+      id: crypto.randomUUID(), ean, by, qty, remaining: qty, price, at: Date.now(),
     });
     refetch();
   }
@@ -152,20 +152,28 @@ export default function App() {
     refetch();
   }
 
-  // Inventura: srovná stav skladu na napočítaná čísla (odpis `remaining`)
-  // a manko rozpočítá rovnoměrně mezi všechny členy (řádky v ledger).
-  async function commitInventura(updates, manko) {
+  // Inventura. `updates` = odpisy/přípisy `remaining` na napočítaná čísla.
+  // `manko` = Σ salda − hodnota skladu (rozpočítá se rovným dílem).
+  // `targets` (onboarding) = mapa jméno→cílové saldo ze SettleUpu; když je
+  // zadaná, nejdřív se app-salda posunou na tyhle hodnoty.
+  async function commitInventura(updates, manko, targets = null) {
     for (const u of updates) {
       await supabase.from("batches").update({ remaining: u.remaining }).eq("id", u.id);
     }
-    const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
-    if (per !== 0) {
-      const at = Date.now();
-      const rows = MEMBERS.map((m) => ({
-        id: crypto.randomUUID(), ean: "__manko__", by: m, price: per, at,
-      }));
-      await supabase.from("ledger").insert(rows);
+    const at = Date.now();
+    const rows = [];
+    if (targets) {
+      const cur = Object.fromEntries(balances.map((b) => [b.name, b.amount]));
+      for (const m of MEMBERS) {
+        // saldo se počítá jako Σnaskladnění − Σledger; ledger odčítá `price`,
+        // takže posun na cíl = price (cur − target).
+        const delta = Math.round(((cur[m] || 0) - Number(targets[m] || 0)) * 100) / 100;
+        if (delta !== 0) rows.push({ id: crypto.randomUUID(), ean: "__settleup__", by: m, price: delta, at });
+      }
     }
+    const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
+    if (per !== 0) for (const m of MEMBERS) rows.push({ id: crypto.randomUUID(), ean: "__manko__", by: m, price: per, at });
+    if (rows.length) await supabase.from("ledger").insert(rows);
     await refetch();
   }
 
@@ -197,7 +205,7 @@ export default function App() {
         {tab === "shop" && <Shop stock={stock} onStock={addBatch} onTake={take} />}
         {tab === "stock" && <Stock stock={stock} />}
         {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} />}
-        {tab === "inv" && <Inventura stock={stock} onCommit={commitInventura} />}
+        {tab === "inv" && <Inventura stock={stock} balances={balances} onStock={addBatch} onCommit={commitInventura} />}
       </main>
 
       <footer style={S.footer}>
@@ -459,14 +467,20 @@ function Stock({ stock }) {
   );
 }
 
-function Inventura({ stock, onCommit }) {
-  const [counts, setCounts] = useState({});   // ean -> zadaný počet (string)
+function Inventura({ stock, balances, onStock, onCommit }) {
+  const [counts, setCounts] = useState({});   // ean -> napočítaný počet (string)
+  const [mode, setMode] = useState("app");     // "app" (opakovaná) | "manual" (onboarding)
+  const [manualVals, setManualVals] = useState({}); // jméno -> saldo (string)
+  const [scanMode, setScanMode] = useState(false);
+  const [draft, setDraft] = useState(null);     // přidání neznámé věci (neutrální)
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(null);
 
-  // Napočítej manko + jaké šarže odepsat (odběr chybějících kusů = FIFO).
-  const { manko, updates } = useMemo(() => {
-    let manko = 0;
+  const curBal = Object.fromEntries(balances.map((b) => [b.name, b.amount]));
+
+  // Odpis/přípis skladu na napočítaná čísla + o kolik se změní hodnota skladu.
+  const { updates, stockDelta } = useMemo(() => {
+    let stockDelta = 0; // hodnota dle appky − napočítaná hodnota
     const updates = [];
     for (const item of stock) {
       const raw = counts[item.ean];
@@ -478,60 +492,73 @@ function Inventura({ stock, onCommit }) {
         for (const b of bs) {
           if (rem <= 0) break;
           const r = Math.min(rem, b.left);
-          manko += r * b.price;
+          stockDelta += r * b.price;
           rem -= r;
           updates.push({ id: b.id, remaining: b.left - r });
         }
       } else if (diff < 0 && bs.length) {
         const nb = bs[bs.length - 1]; // přebytek přičti k nejnovější šarži
         const add = -diff;
-        manko -= add * nb.price;
+        stockDelta -= add * nb.price;
         updates.push({ id: nb.id, remaining: nb.left + add });
       }
     }
-    return { manko, updates };
+    return { updates, stockDelta };
   }, [stock, counts]);
 
   const bookValue = stock.reduce((s, x) => s + x.batches.reduce((t, b) => t + b.left * b.price, 0), 0);
-  const countedValue = bookValue - manko;
+  const countedValue = bookValue - stockDelta;
+
+  const getVal = (m) => {
+    const raw = manualVals[m];
+    return raw === undefined || raw === "" ? (curBal[m] || 0) : Number(raw);
+  };
+  const B = mode === "manual"
+    ? MEMBERS.reduce((s, m) => s + getVal(m), 0)
+    : balances.reduce((s, b) => s + b.amount, 0);
+
+  const manko = Math.round((B - countedValue) * 100) / 100;
   const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
+
+  function onScanned(ean) {
+    setScanMode(false);
+    setDraft({ ean, name: "", qty: 1, price: "" });
+    lookupEAN(ean).then((name) => {
+      if (name) setDraft((d) => (d && d.ean === ean && !d.name ? { ...d, name } : d));
+    });
+  }
 
   async function commit() {
     if (busy) return;
     const msg = manko >= 0
-      ? `Zaúčtovat manko ${KC(manko)}? Každému z ${MEMBERS.length} přibude dluh ${KC(per)}. Nejde vzít zpět.`
-      : `Přebytek ${KC(-manko)} — každému připíšeme kredit ${KC(-per)}. Zaúčtovat? Nejde vzít zpět.`;
+      ? `Zaúčtovat manko ${KC(manko)}? Každému z ${MEMBERS.length} přibude dluh ${KC(per)}.${mode === "manual" ? " Salda se nastaví na zadané." : ""} Nejde vzít zpět.`
+      : `Přebytek ${KC(-manko)} — každému kredit ${KC(-per)}.${mode === "manual" ? " Salda se nastaví na zadané." : ""} Zaúčtovat? Nejde vzít zpět.`;
     if (!window.confirm(msg)) return;
     setBusy(true);
-    await onCommit(updates, manko);
+    const targets = mode === "manual" ? Object.fromEntries(MEMBERS.map((m) => [m, getVal(m)])) : null;
+    await onCommit(updates, manko, targets);
     setBusy(false);
     setDone({ manko, per });
-    setCounts({});
-  }
-
-  if (stock.length === 0) {
-    return (
-      <section style={S.card}>
-        <div style={S.cardTitle}>Inventura</div>
-        <p style={S.empty}>Sklad je prázdný. Nejdřív naskladni věci (přes Naskladnit / Vzít), pak jde dělat inventuru.</p>
-      </section>
-    );
+    setCounts({}); setManualVals({});
   }
 
   return (
     <>
       <section style={S.card}>
-        <div style={S.cardTitle}>Inventura — napočítej regál</div>
-        <p style={S.cardLead}>U každé věci zadej, kolik jich reálně je. Předvyplněno stavem z appky; přepiš jen rozdíly.</p>
-        {stock.map((item) => (
+        <div style={S.cardTitle}>1 · Zboží v samošce</div>
+        <p style={S.cardLead}>Napočítej, co reálně je na regálu. Co v appce chybí, přidej (kupce neřešíme).</p>
+        <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+          <button style={S.primary} onClick={() => setScanMode(true)}>📷 Skenovat</button>
+          <button style={S.ghost} onClick={() => setDraft({ ean: "", name: "", qty: 1, price: "" })}>Přidat ručně</button>
+        </div>
+        {stock.length === 0 ? (
+          <p style={S.empty}>Zatím prázdno. Naskenuj nebo přidej věci, co v samošce jsou.</p>
+        ) : stock.map((item) => (
           <div key={item.ean} style={S.invRow}>
             <span style={S.invName}>{item.name}</span>
             <span style={S.invBook}>app {item.qty}×</span>
             <input
-              style={S.invInput}
-              type="number"
-              min="0"
-              inputMode="numeric"
+              style={S.invInput} type="number" min="0" inputMode="numeric"
               value={counts[item.ean] ?? String(item.qty)}
               onChange={(e) => setCounts((c) => ({ ...c, [item.ean]: e.target.value }))}
             />
@@ -539,11 +566,41 @@ function Inventura({ stock, onCommit }) {
         ))}
       </section>
 
+      <section style={S.card}>
+        <div style={S.cardTitle}>2 · Salda členů</div>
+        <div style={S.segwrap}>
+          <button style={{ ...S.seg, ...(mode === "app" ? S.segOn : {}) }} onClick={() => setMode("app")}>Z appky</button>
+          <button style={{ ...S.seg, ...(mode === "manual" ? S.segOn : {}) }} onClick={() => setMode("manual")}>Zadat ručně</button>
+        </div>
+        <p style={S.cardLead}>
+          {mode === "app"
+            ? "Vezmou se aktuální salda z appky (opakovaná inventura)."
+            : "Vyplň aktuální salda ze SettleUpu. + = samoška dluží jemu, − = on dluží samošce."}
+        </p>
+        {MEMBERS.map((m) => (
+          <div key={m} style={S.invRow}>
+            <span style={S.invName}>{m}</span>
+            {mode === "app" ? (
+              <span style={{ ...S.balAmt, gridColumn: "2 / 4", color: (curBal[m] || 0) >= 0 ? "var(--pos)" : "var(--neg)" }}>
+                {(curBal[m] || 0) >= 0 ? "+" : ""}{KC(curBal[m] || 0)}
+              </span>
+            ) : (
+              <input
+                style={{ ...S.invInput, gridColumn: "2 / 4", textAlign: "right" }}
+                type="number" step="0.01" inputMode="decimal"
+                value={manualVals[m] ?? String(curBal[m] || 0)}
+                onChange={(e) => setManualVals((v) => ({ ...v, [m]: e.target.value }))}
+              />
+            )}
+          </div>
+        ))}
+      </section>
+
       <section style={{ ...S.card, ...S.cardActive }}>
-        <div style={S.cardTitle}>Výsledek</div>
+        <div style={S.cardTitle}>3 · Výsledek</div>
         <div style={S.invSum}>
-          <div style={S.invSumRow}><span>Hodnota dle appky</span><b>{KC(bookValue)}</b></div>
-          <div style={S.invSumRow}><span>Napočítáno</span><b>{KC(countedValue)}</b></div>
+          <div style={S.invSumRow}><span>Σ salda členů</span><b>{KC(B)}</b></div>
+          <div style={S.invSumRow}><span>Hodnota skladu (napočítáno)</span><b>{KC(countedValue)}</b></div>
           <div style={S.invSumRow}>
             <span>{manko >= 0 ? "Manko (chybí)" : "Přebytek"}</span>
             <b style={{ color: manko >= 0 ? "var(--neg)" : "var(--pos)" }}>{KC(Math.abs(manko))}</b>
@@ -555,18 +612,26 @@ function Inventura({ stock, onCommit }) {
         </div>
         <p style={S.hint}>
           {manko >= 0
-            ? "Manko rozpočítáme jako dluh každému z členů rovným dílem."
-            : "Přebytek připíšeme každému jako kredit rovným dílem."}
+            ? "Manko = Σ salda − hodnota skladu. Rozpočítá se jako dluh každému rovným dílem."
+            : "Sklad je hodnotnější než salda → přebytek, každému se připíše kredit."}
         </p>
         <button style={{ ...S.primary, opacity: busy ? 0.5 : 1, width: "100%" }} disabled={busy} onClick={commit}>
-          {busy ? "Účtuju…" : (manko === 0 ? "Sklad sedí — srovnat" : `Zaúčtovat ${KC(Math.abs(manko))}`)}
+          {busy ? "Účtuju…" : (manko === 0 && mode === "app" ? "Sedí — srovnat sklad" : `Zaúčtovat ${KC(Math.abs(manko))}`)}
         </button>
         {done && (
-          <div style={S.invDone}>
-            Hotovo — zaúčtováno {KC(Math.abs(done.manko))} ({KC(Math.abs(done.per))}/os).
-          </div>
+          <div style={S.invDone}>Hotovo — zaúčtováno {KC(Math.abs(done.manko))} ({KC(Math.abs(done.per))}/os).</div>
         )}
       </section>
+
+      {scanMode && <Scanner onScanned={onScanned} onClose={() => setScanMode(false)} />}
+      {draft && (
+        <StockForm
+          draft={draft}
+          setDraft={setDraft}
+          onSave={(d) => { onStock(d.ean || "man-" + crypto.randomUUID().slice(0, 8), d.name || "Bezejmenné", d.qty, d.price, "__inventura__"); setDraft(null); }}
+          onCancel={() => setDraft(null)}
+        />
+      )}
     </>
   );
 }
@@ -763,6 +828,9 @@ const S = {
   invSum: { display: "flex", flexDirection: "column", gap: 6, margin: "6px 0 4px" },
   invSumRow: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 14 },
   invDone: { marginTop: 12, background: "rgba(31,122,77,.1)", color: "var(--pos)", borderRadius: 10, padding: "10px 12px", fontSize: 13.5, fontWeight: 600 },
+  segwrap: { display: "flex", gap: 4, background: "#fff", border: "1px solid var(--line)", borderRadius: 11, padding: 3, marginBottom: 10 },
+  seg: { flex: 1, padding: "9px 8px", background: "none", border: "none", borderRadius: 9, fontSize: 13.5, fontWeight: 600, color: "var(--sub)" },
+  segOn: { background: "var(--brand)", color: "#fff" },
 
   stockTotal: { fontFamily: mono, fontSize: 13, color: "var(--sub)", marginBottom: 12 },
   stockItem: { borderTop: "1px solid var(--line)", padding: "2px 0" },
