@@ -1,13 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { createClient } from "@supabase/supabase-js";
 
 // ─────────────────────────────────────────────────────────────
 // KMEN · SAMOŠKA
-// Prototyp bez backendu. Data se ukládají lokálně (localStorage)
-// v každém telefonu zvlášť — sdílený stav mezi lidmi přijde až
-// s backendem. Slouží k vyzkoušení flow: scan → naskladnit →
-// vzít → salda.
+// Sdílený sklad přes Supabase (Postgres). Sklad, šarže a salda
+// jsou společné pro všechny; identita ("kdo jsem") zůstává lokální
+// v telefonu. Realtime → změny se propíšou všem naráz.
 // ─────────────────────────────────────────────────────────────
+
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
 // Členy nastav v `.env` přes VITE_MEMBERS (čárkou oddělená jména).
 const MEMBERS = (import.meta.env.VITE_MEMBERS || "")
@@ -18,7 +23,7 @@ const MEMBERS = (import.meta.env.VITE_MEMBERS || "")
 const KC = (n) =>
   new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(n) + " Kč";
 
-// ── localStorage persistence ────────────────────────────────
+// ── "kdo jsem" zůstává lokální v telefonu ───────────────────
 const load = (k, fallback) => {
   try { const v = localStorage.getItem("samoska." + k); return v ? JSON.parse(v) : fallback; }
   catch { return fallback; }
@@ -46,14 +51,34 @@ async function lookupEAN(ean) {
 export default function App() {
   const [me, setMe] = useState(() => load("me", null));
   const [tab, setTab] = useState("shop");
-  const [products, setProducts] = useState(() => load("products", {}));
-  const [batches, setBatches] = useState(() => load("batches", []));
-  const [ledger, setLedger] = useState(() => load("ledger", []));
+  const [products, setProducts] = useState({});
+  const [batches, setBatches] = useState([]);
+  const [ledger, setLedger] = useState([]);
 
   useEffect(() => save("me", me), [me]);
-  useEffect(() => save("products", products), [products]);
-  useEffect(() => save("batches", batches), [batches]);
-  useEffect(() => save("ledger", ledger), [ledger]);
+
+  // Načti sdílený stav z Supabase (DB sloupec `remaining` → v appce `left`).
+  async function refetch() {
+    const [p, b, l] = await Promise.all([
+      supabase.from("products").select("*"),
+      supabase.from("batches").select("*"),
+      supabase.from("ledger").select("*"),
+    ]);
+    if (p.data) setProducts(Object.fromEntries(p.data.map((r) => [r.ean, { ean: r.ean, name: r.name }])));
+    if (b.data) setBatches(b.data.map((r) => ({ id: r.id, ean: r.ean, by: r.by, qty: r.qty, left: r.remaining, price: Number(r.price), at: r.at })));
+    if (l.data) setLedger(l.data.map((r) => ({ id: r.id, ean: r.ean, by: r.by, price: Number(r.price), at: r.at })));
+  }
+
+  useEffect(() => {
+    refetch();
+    const ch = supabase
+      .channel("samoska")
+      .on("postgres_changes", { event: "*", schema: "public", table: "products" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "batches" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "ledger" }, refetch)
+      .subscribe();
+    return () => { supabase.removeChannel(ch); };
+  }, []);
 
   const stock = useMemo(() => {
     const map = {};
@@ -80,19 +105,22 @@ export default function App() {
     return { from: bottom.name, to: top.name, amount: Math.min(-bottom.amount, top.amount) };
   }, [balances]);
 
-  function addBatch(ean, name, qty, price) {
-    setProducts((p) => ({ ...p, [ean]: { ean, name } }));
-    setBatches((bs) => [
-      ...bs,
-      { id: crypto.randomUUID(), ean, by: me, qty, left: qty, price, at: Date.now() },
-    ]);
+  async function addBatch(ean, name, qty, price) {
+    await supabase.from("products").upsert({ ean, name });
+    await supabase.from("batches").insert({
+      id: crypto.randomUUID(), ean, by: me, qty, remaining: qty, price, at: Date.now(),
+    });
+    refetch();
   }
 
-  function take(ean) {
-    const b = batches.filter((x) => x.ean === ean && x.left > 0).sort((a, b) => a.at - b.at)[0];
-    if (!b) return;
-    setBatches((bs) => bs.map((x) => (x.id === b.id ? { ...x, left: x.left - 1 } : x)));
-    setLedger((lg) => [...lg, { id: crypto.randomUUID(), ean, by: me, price: b.price, at: Date.now() }]);
+  // FIFO odběr atomicky na serveru (RPC take_item) — dva lidi naráz
+  // nerozbijí `remaining` ani nevezmou stejný kus dvakrát.
+  async function take(ean) {
+    const { error } = await supabase.rpc("take_item", {
+      p_ean: ean, p_by: me, p_id: crypto.randomUUID(), p_at: Date.now(),
+    });
+    if (error) alert("Nepovedlo se vzít: " + error.message);
+    refetch();
   }
 
   if (!me) return <NamePicker onPick={setMe} />;
@@ -126,7 +154,7 @@ export default function App() {
       </main>
 
       <footer style={S.footer}>
-        Prototyp · data jsou uložená jen v tomhle telefonu (localStorage)
+        Sdílený sklad · živě přes Supabase
       </footer>
     </div>
   );
