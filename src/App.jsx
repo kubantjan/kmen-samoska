@@ -322,6 +322,10 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
     return () => { live = false; clearTimeout(t); };
   }, [draft.name, picked]);
 
+  // Po "Přidat ručně" (bez EANu) skoč kurzorem rovnou do názvu.
+  const nameRef = useRef(null);
+  useEffect(() => { if (!draft.ean) nameRef.current?.focus(); }, []);
+
   function setName(v) { setPicked(false); setDraft({ ...draft, name: v }); }
   function pick(r) {
     setDraft({ ...draft, name: r.name, price: String(r.price) });
@@ -334,7 +338,7 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
       <div style={S.cardTitle}>Naskladnění</div>
       {draft.ean && <div style={S.eanTag}>EAN {draft.ean}</div>}
       <label style={S.label}>Název — piš a vyber z Rohlíku (doplní název i cenu)</label>
-      <input style={S.input} value={draft.name} placeholder="Kečup Heinz 500g"
+      <input ref={nameRef} style={S.input} value={draft.name} placeholder="Kečup Heinz 500g"
         onChange={(e) => setName(e.target.value)} />
 
       {!picked && rohlikLoading && rohlik.length === 0 && (
