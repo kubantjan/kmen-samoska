@@ -80,8 +80,17 @@ export default function App() {
   const [products, setProducts] = useState({});
   const [batches, setBatches] = useState([]);
   const [ledger, setLedger] = useState([]);
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => save("me", me), [me]);
+
+  // Sleduj přihlášení (sdílený účet). Session drží Supabase v localStorage.
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthReady(true); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
 
   // Načti sdílený stav z Supabase (DB sloupec `remaining` → v appce `left`).
   async function refetch() {
@@ -95,7 +104,9 @@ export default function App() {
     if (l.data) setLedger(l.data.map((r) => ({ id: r.id, ean: r.ean, by: r.by, price: Number(r.price), at: r.at })));
   }
 
+  // Data ber až po přihlášení (RLS je jen pro authenticated).
   useEffect(() => {
+    if (!session) { setProducts({}); setBatches([]); setLedger([]); return; }
     refetch();
     const ch = supabase
       .channel("samoska")
@@ -104,7 +115,7 @@ export default function App() {
       .on("postgres_changes", { event: "*", schema: "public", table: "ledger" }, refetch)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
-  }, []);
+  }, [session]);
 
   const stock = useMemo(() => {
     const map = {};
@@ -152,6 +163,8 @@ export default function App() {
     refetch();
   }
 
+  if (!authReady) return null;
+  if (!session) return <Login />;
   if (!me) return <NamePicker onPick={setMe} />;
 
   return (
@@ -183,8 +196,52 @@ export default function App() {
       </main>
 
       <footer style={S.footer}>
-        Sdílený sklad · živě přes Supabase
+        Sdílený sklad · živě přes Supabase ·{" "}
+        <button style={S.logout} onClick={() => supabase.auth.signOut()}>odhlásit</button>
       </footer>
+    </div>
+  );
+}
+
+function Login() {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e?.preventDefault();
+    if (!pw || busy) return;
+    setBusy(true); setErr(null);
+    const { error } = await supabase.auth.signInWithPassword({
+      email: import.meta.env.VITE_SUPABASE_LOGIN_EMAIL,
+      password: pw,
+    });
+    if (error) { setErr("Špatné heslo, zkus to znovu."); setBusy(false); }
+    // úspěch → onAuthStateChange přepne appku, není třeba nic dělat
+  }
+
+  return (
+    <div style={S.wrap}>
+      <style>{CSS}</style>
+      <div style={S.pickerHero}>
+        <div style={S.kicker}>KMEN · BARÁKOVÁ</div>
+        <div style={S.wordmarkBig}>SAMOŠKA</div>
+        <p style={S.pickerLead}>Zadej společné heslo, ať se dostaneš do samošky.</p>
+      </div>
+      <form style={S.loginForm} onSubmit={submit}>
+        <input
+          style={S.input}
+          type="password"
+          value={pw}
+          placeholder="Společné heslo"
+          autoFocus
+          onChange={(e) => setPw(e.target.value)}
+        />
+        {err && <div style={S.loginErr}>{err}</div>}
+        <button type="submit" style={{ ...S.primary, opacity: pw && !busy ? 1 : 0.5 }} disabled={!pw || busy}>
+          {busy ? "Přihlašuju…" : "Vstoupit"}
+        </button>
+      </form>
     </div>
   );
 }
@@ -642,6 +699,10 @@ const S = {
   balBar: { position: "absolute", top: 0, bottom: 0, borderRadius: 3 },
   balMid: { position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "var(--line)" },
   balAmt: { fontFamily: mono, fontSize: 13, fontWeight: 700, textAlign: "right" },
+
+  loginForm: { display: "flex", flexDirection: "column", gap: 12, padding: "0 22px", maxWidth: 420, margin: "0 auto", width: "100%" },
+  loginErr: { color: "var(--neg)", fontSize: 13.5, fontWeight: 600 },
+  logout: { background: "none", border: "none", color: "var(--sub)", fontFamily: mono, fontSize: 10.5, letterSpacing: 0.5, textDecoration: "underline", cursor: "pointer", padding: 0 },
 
   pickerHero: { padding: "40px 22px 20px", textAlign: "center" },
   pickerLead: { fontSize: 15, color: "var(--sub)", marginTop: 10 },
