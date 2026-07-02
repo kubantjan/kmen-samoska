@@ -23,6 +23,9 @@ const MEMBERS = (import.meta.env.VITE_MEMBERS || "")
 const KC = (n) =>
   new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(n) + " Kč";
 
+// Hledání bez ohledu na velikost písmen a diakritiku ("mleko" najde "Mléko").
+const norm = (s) => (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+
 // ── "kdo jsem" zůstává lokální v telefonu ───────────────────
 const load = (k, fallback) => {
   try { const v = localStorage.getItem("samoska." + k); return v ? JSON.parse(v) : fallback; }
@@ -203,6 +206,9 @@ function Shop({ stock, onStock, onTake }) {
   const [scanMode, setScanMode] = useState(null); // "stock" | "take" | null
   const [draft, setDraft] = useState(null);       // formulář naskladnění
   const [takeItem, setTakeItem] = useState(null);  // potvrzení odběru
+  const [q, setQ] = useState("");                  // hledání ve skladu
+
+  const filtered = q.trim() ? stock.filter((s) => norm(s.name).includes(norm(q))) : stock;
 
   function openTake(s) {
     const next = s.batches.slice().sort((a, b) => a.at - b.at)[0];
@@ -254,11 +260,16 @@ function Shop({ stock, onStock, onTake }) {
         <button style={{ ...S.ghost, marginBottom: 12 }} onClick={() => setScanMode("take")}>
           📷 Skenovat &amp; vzít
         </button>
+        {stock.length > 5 && (
+          <SearchBox q={q} setQ={setQ} count={filtered.length} />
+        )}
         {stock.length === 0 ? (
           <p style={S.empty}>Sklad je zatím prázdný. Něco přikup a objeví se to tady.</p>
+        ) : filtered.length === 0 ? (
+          <p style={S.empty}>Nic ve skladu neodpovídá „{q}".</p>
         ) : (
           <div style={S.takeList}>
-            {stock.map((s) => {
+            {filtered.map((s) => {
               const next = s.batches.slice().sort((a, b) => a.at - b.at)[0];
               return (
                 <button key={s.ean} style={S.takeRow} onClick={() => openTake(s)}>
@@ -352,16 +363,41 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
   );
 }
 
+function SearchBox({ q, setQ, count }) {
+  return (
+    <div style={S.searchWrap}>
+      <span style={S.searchIcon}>🔎</span>
+      <input
+        style={S.searchInput}
+        value={q}
+        placeholder="Hledat ve skladu…"
+        onChange={(e) => setQ(e.target.value)}
+      />
+      {q && (
+        <button style={S.searchClear} onClick={() => setQ("")} aria-label="Vymazat">
+          ✕
+        </button>
+      )}
+      {q.trim() && <span style={S.searchCount}>{count}</span>}
+    </div>
+  );
+}
+
 function Stock({ stock }) {
   const [open, setOpen] = useState(null);
+  const [q, setQ] = useState("");
   const total = stock.reduce((s, x) => s + x.batches.reduce((t, b) => t + b.left * b.price, 0), 0);
+  const filtered = q.trim() ? stock.filter((s) => norm(s.name).includes(norm(q))) : stock;
   return (
     <section style={S.card}>
       <div style={S.cardTitle}>Co je teď v samošce</div>
       <div style={S.stockTotal}>Hodnota skladu <b>{KC(total)}</b></div>
+      {stock.length > 5 && <SearchBox q={q} setQ={setQ} count={filtered.length} />}
       {stock.length === 0 ? (
         <p style={S.empty}>Prázdno. Až něco přikoupíte, uvidíte to tady.</p>
-      ) : stock.map((s) => (
+      ) : filtered.length === 0 ? (
+        <p style={S.empty}>Nic ve skladu neodpovídá „{q}".</p>
+      ) : filtered.map((s) => (
         <div key={s.ean} style={S.stockItem}>
           <button style={S.stockHead} onClick={() => setOpen(open === s.ean ? null : s.ean)}>
             <span style={S.takeName}>{s.name}</span>
@@ -581,6 +617,12 @@ const S = {
   rohlikPrice: { fontFamily: mono, fontSize: 18, fontWeight: 800, color: "var(--ink)" },
   rohlikUse: { background: "#00A56C", color: "#fff", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 13, fontWeight: 700 },
   rohlikNote: { fontSize: 11, color: "var(--sub)", marginTop: 8 },
+
+  searchWrap: { position: "relative", display: "flex", alignItems: "center", marginBottom: 12 },
+  searchIcon: { position: "absolute", left: 12, fontSize: 14, opacity: 0.6, pointerEvents: "none" },
+  searchInput: { width: "100%", padding: "11px 68px 11px 36px", fontSize: 15, border: "1px solid var(--line)", borderRadius: 10, background: "#fff", fontFamily: sans },
+  searchClear: { position: "absolute", right: 40, background: "none", border: "none", color: "var(--sub)", fontSize: 15, padding: 4, lineHeight: 1 },
+  searchCount: { position: "absolute", right: 12, fontFamily: mono, fontSize: 12, fontWeight: 700, color: "var(--sub)" },
   scanBox: { width: "100%", maxWidth: 460, background: "var(--ink)", borderRadius: 16, overflow: "hidden" },
   video: { width: "100%", height: 300, objectFit: "cover", display: "block", background: "#000" },
   scanFrame: { position: "absolute", top: "50%", left: "12%", right: "12%", height: 110, marginTop: -55, border: "2px solid var(--accent)", borderRadius: 10, pointerEvents: "none" },
