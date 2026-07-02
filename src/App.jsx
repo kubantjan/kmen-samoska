@@ -179,11 +179,24 @@ function NamePicker({ onPick }) {
 }
 
 function Shop({ stock, onStock, onTake }) {
-  const [scanning, setScanning] = useState(false);
-  const [draft, setDraft] = useState(null);
+  const [scanMode, setScanMode] = useState(null); // "stock" | "take" | null
+  const [draft, setDraft] = useState(null);       // formulář naskladnění
+  const [takeItem, setTakeItem] = useState(null);  // potvrzení odběru
+
+  function openTake(s) {
+    const next = s.batches.slice().sort((a, b) => a.at - b.at)[0];
+    setTakeItem({ ean: s.ean, name: s.name, price: next.price, qty: s.qty });
+  }
 
   function onScanned(ean) {
-    setScanning(false);
+    const mode = scanMode;
+    setScanMode(null);
+    if (mode === "take") {
+      const s = stock.find((x) => x.ean === ean);
+      if (!s) { alert("Tohle v samošce zatím není — nejdřív to musí někdo naskladnit."); return; }
+      openTake(s);
+      return;
+    }
     setDraft({ ean, name: "", qty: 1, price: "" });
     lookupEAN(ean).then((name) => {
       if (name) setDraft((d) => (d && d.ean === ean && !d.name ? { ...d, name } : d));
@@ -196,14 +209,14 @@ function Shop({ stock, onStock, onTake }) {
         <div style={S.cardTitle}>Přikoupil jsem do samošky</div>
         <p style={S.cardLead}>Naskenuj čárový kód, nebo přidej ručně.</p>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button style={S.primary} onClick={() => setScanning(true)}>📷 Skenovat kód</button>
+          <button style={S.primary} onClick={() => setScanMode("stock")}>📷 Skenovat kód</button>
           <button style={S.ghost} onClick={() => setDraft({ ean: "", name: "", qty: 1, price: "" })}>
             Přidat ručně
           </button>
         </div>
       </section>
 
-      {scanning && <Scanner onScanned={onScanned} onClose={() => setScanning(false)} />}
+      {scanMode && <Scanner onScanned={onScanned} onClose={() => setScanMode(null)} />}
 
       {draft && (
         <StockForm
@@ -216,6 +229,10 @@ function Shop({ stock, onStock, onTake }) {
 
       <section style={S.card}>
         <div style={S.cardTitle}>Beru ze samošky</div>
+        <p style={S.cardLead}>Klepni na položku, nebo naskenuj kód věci, kterou si bereš.</p>
+        <button style={{ ...S.ghost, marginBottom: 12 }} onClick={() => setScanMode("take")}>
+          📷 Skenovat &amp; vzít
+        </button>
         {stock.length === 0 ? (
           <p style={S.empty}>Sklad je zatím prázdný. Něco přikup a objeví se to tady.</p>
         ) : (
@@ -223,7 +240,7 @@ function Shop({ stock, onStock, onTake }) {
             {stock.map((s) => {
               const next = s.batches.slice().sort((a, b) => a.at - b.at)[0];
               return (
-                <button key={s.ean} style={S.takeRow} onClick={() => onTake(s.ean)}>
+                <button key={s.ean} style={S.takeRow} onClick={() => openTake(s)}>
                   <span style={S.takeName}>{s.name}</span>
                   <span style={S.takeMeta}>
                     <span style={S.qtyBadge}>{s.qty}×</span>
@@ -234,8 +251,16 @@ function Shop({ stock, onStock, onTake }) {
             })}
           </div>
         )}
-        <p style={S.hint}>Klepnutím si vezmeš 1 kus za cenu nejstaršího naskladněného (FIFO).</p>
+        <p style={S.hint}>Bereš 1 kus za cenu nejstaršího naskladněného (FIFO). Před zapsáním se zeptáme na potvrzení.</p>
       </section>
+
+      {takeItem && (
+        <ConfirmTake
+          item={takeItem}
+          onConfirm={() => { onTake(takeItem.ean); setTakeItem(null); }}
+          onCancel={() => setTakeItem(null)}
+        />
+      )}
     </>
   );
 }
@@ -332,6 +357,30 @@ function Balance({ balances, suggestion, me }) {
       </div>
       <p style={S.hint}>Plus = samoška ti dluží (přikoupil jsi víc, než vzal). Mínus = dlužíš samošce.</p>
     </section>
+  );
+}
+
+// ── Potvrzení odběru ────────────────────────────────────────
+function ConfirmTake({ item, onConfirm, onCancel }) {
+  const pricey = item.price >= 500;
+  return (
+    <div style={S.scanOverlay} onClick={onCancel}>
+      <div style={S.confirmBox} onClick={(e) => e.stopPropagation()}>
+        <div style={S.confirmKicker}>BEREŠ ZE SAMOŠKY</div>
+        <div style={S.confirmName}>{item.name}</div>
+        <div style={{ ...S.confirmPrice, color: pricey ? "var(--neg)" : "var(--brand-ink)" }}>
+          {KC(item.price)}
+        </div>
+        <div style={S.confirmMeta}>
+          Zaplatíš cenu nejstarší šarže (FIFO) · skladem {item.qty}×
+          {pricey && <div style={S.confirmWarn}>⚠️ Dražší položka — zkontroluj, že si bereš tohle.</div>}
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+          <button style={{ ...S.primary, flex: 1 }} onClick={onConfirm}>Vzít za {KC(item.price)}</button>
+          <button style={S.ghost} onClick={onCancel}>Zrušit</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -460,6 +509,13 @@ const S = {
   nameTile: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: "22px 10px", fontSize: 17, fontWeight: 700, color: "var(--ink)" },
 
   scanOverlay: { position: "fixed", inset: 0, background: "rgba(20,18,14,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 },
+
+  confirmBox: { width: "100%", maxWidth: 420, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 18, padding: "22px 20px" },
+  confirmKicker: { fontFamily: mono, fontSize: 11, letterSpacing: 2, color: "var(--sub)" },
+  confirmName: { fontSize: 22, fontWeight: 800, letterSpacing: -0.5, margin: "6px 0 10px", lineHeight: 1.15 },
+  confirmPrice: { fontFamily: mono, fontSize: 34, fontWeight: 800, letterSpacing: -1 },
+  confirmMeta: { fontSize: 13, color: "var(--sub)", marginTop: 10, lineHeight: 1.5 },
+  confirmWarn: { color: "var(--neg)", fontWeight: 700, marginTop: 8 },
   scanBox: { width: "100%", maxWidth: 460, background: "var(--ink)", borderRadius: 16, overflow: "hidden" },
   video: { width: "100%", height: 300, objectFit: "cover", display: "block", background: "#000" },
   scanFrame: { position: "absolute", top: "50%", left: "12%", right: "12%", height: 110, marginTop: -55, border: "2px solid var(--accent)", borderRadius: 10, pointerEvents: "none" },
