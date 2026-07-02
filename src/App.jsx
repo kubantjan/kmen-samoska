@@ -154,6 +154,19 @@ export default function App() {
     refetch();
   }
 
+  // Platba mezi lidmi (A pošle B prachy). Přesun mezi dvěma salda — Σ se
+  // nemění: plátci saldo stoupne (dluží míň), příjemci klesne (má míň k dobru).
+  async function recordPayment(from, to, amount) {
+    const amt = Math.round(Number(amount) * 100) / 100;
+    if (!from || !to || from === to || !(amt > 0)) return;
+    const at = Date.now();
+    await supabase.from("ledger").insert([
+      { id: crypto.randomUUID(), ean: "__platba__", by: from, price: -amt, at },
+      { id: crypto.randomUUID(), ean: "__platba__", by: to, price: amt, at },
+    ]);
+    await refetch();
+  }
+
   // Inventura. `updates` = odpisy/přípisy `remaining` na napočítaná čísla.
   // `manko` = Σ salda − hodnota skladu (rozpočítá se rovným dílem).
   // `targets` (onboarding) = mapa jméno→cílové saldo ze SettleUpu; když je
@@ -206,7 +219,7 @@ export default function App() {
       <main style={S.main}>
         {tab === "shop" && <Shop stock={stock} onStock={addBatch} onTake={take} />}
         {tab === "stock" && <Stock stock={stock} />}
-        {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} />}
+        {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} onPay={recordPayment} />}
         {tab === "hist" && <History batches={batches} ledger={ledger} products={products} />}
         {tab === "inv" && <Inventura stock={stock} balances={balances} onStock={addBatch} onCommit={commitInventura} />}
       </main>
@@ -482,7 +495,7 @@ function History({ batches, ledger, products }) {
     });
   }
 
-  const grouped = {}; // seskup __manko__/__settleup__ podle času do jedné události
+  const grouped = {}; // seskup __manko__/__settleup__/__platba__ podle času
   for (const l of ledger) {
     if (l.ean === "__manko__" || l.ean === "__settleup__") {
       const key = l.ean + "@" + l.at;
@@ -491,6 +504,13 @@ function History({ batches, ledger, products }) {
         events.push(grouped[key]);
       }
       grouped[key].sum += l.price; grouped[key].n++;
+    } else if (l.ean === "__platba__") {
+      const key = "__platba__@" + l.at;
+      if (!grouped[key]) {
+        grouped[key] = { at: l.at, kind: "pay", from: null, to: null, amount: 0 };
+        events.push(grouped[key]);
+      }
+      if (l.price < 0) grouped[key].from = l.by; else { grouped[key].to = l.by; grouped[key].amount = l.price; }
     } else {
       events.push({ at: l.at, kind: "take", who: l.by, name: nameOf(l.ean), amount: l.price });
     }
@@ -520,6 +540,10 @@ function History({ batches, ledger, products }) {
             icon = "−"; color = "var(--neg)";
             text = <><b>{e.who}</b> vzal {e.name}</>;
             amount = "−" + KC(e.amount);
+          } else if (e.kind === "pay") {
+            icon = "💸"; color = "var(--brand-ink)";
+            text = <><b>{e.from}</b> → <b>{e.to}</b> <span style={S.histSub}>platba</span></>;
+            amount = KC(e.amount);
           } else if (e.kind === "manko") {
             icon = "⚖"; color = e.sum >= 0 ? "var(--neg)" : "var(--pos)";
             text = <>Inventura: {e.sum >= 0 ? "manko" : "přebytek"} rozpočítáno <span style={S.histSub}>({KC(Math.abs(e.sum / (e.n || 1)))}/os)</span></>;
@@ -714,14 +738,24 @@ function Inventura({ stock, balances, onStock, onCommit }) {
   );
 }
 
-function Balance({ balances, suggestion, me }) {
+function Balance({ balances, suggestion, me, onPay }) {
   const max = Math.max(1, ...balances.map((b) => Math.abs(b.amount)));
+  const [pay, setPay] = useState(null); // {from, to, amount} formulář platby
+  const [busy, setBusy] = useState(false);
+
+  function openPay(seed) {
+    setPay(seed || { from: suggestion?.from || me, to: suggestion?.to || "", amount: suggestion ? String(suggestion.amount) : "" });
+  }
+
   return (
     <section style={S.card}>
       <div style={S.cardTitle}>Kdo je v plusu, kdo v mínusu</div>
       {suggestion && (
         <div style={S.suggest}>
-          <b>{suggestion.from}</b> pošle <b>{KC(suggestion.amount)}</b> → <b>{suggestion.to}</b>
+          <div><b>{suggestion.from}</b> pošle <b>{KC(suggestion.amount)}</b> → <b>{suggestion.to}</b></div>
+          <button style={S.suggestBtn} onClick={() => openPay({ from: suggestion.from, to: suggestion.to, amount: String(suggestion.amount) })}>
+            Zaznamenat
+          </button>
         </div>
       )}
       <div style={S.balList}>
@@ -742,7 +776,59 @@ function Balance({ balances, suggestion, me }) {
         })}
       </div>
       <p style={S.hint}>Plus = samoška ti dluží (přikoupil jsi víc, než vzal). Mínus = dlužíš samošce.</p>
+      <button style={{ ...S.ghost, width: "100%", marginTop: 12 }} onClick={() => openPay()}>💸 Zaznamenat platbu</button>
+
+      {pay && (
+        <PayForm
+          pay={pay} setPay={setPay} busy={busy}
+          onSubmit={async () => {
+            if (busy) return;
+            setBusy(true);
+            await onPay(pay.from, pay.to, pay.amount);
+            setBusy(false);
+            setPay(null);
+          }}
+          onCancel={() => setPay(null)}
+        />
+      )}
     </section>
+  );
+}
+
+function PayForm({ pay, setPay, onSubmit, onCancel, busy }) {
+  const valid = pay.from && pay.to && pay.from !== pay.to && Number(pay.amount) > 0;
+  return (
+    <div style={S.formOverlay} onClick={onCancel}>
+      <section style={{ ...S.card, ...S.cardActive, ...S.formBox }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.cardTitle}>Zaznamenat platbu</div>
+        <p style={S.cardLead}>Kdo komu poslal prachy mimo appku (dorovnání salda).</p>
+        <div style={{ display: "flex", gap: 12 }}>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Od koho</label>
+            <select style={S.input} value={pay.from} onChange={(e) => setPay({ ...pay, from: e.target.value })}>
+              <option value="">—</option>
+              {MEMBERS.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Komu</label>
+            <select style={S.input} value={pay.to} onChange={(e) => setPay({ ...pay, to: e.target.value })}>
+              <option value="">—</option>
+              {MEMBERS.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+        </div>
+        <label style={S.label}>Kolik (Kč)</label>
+        <input style={S.input} type="number" min="0" step="0.01" inputMode="decimal" value={pay.amount}
+          placeholder="150" onChange={(e) => setPay({ ...pay, amount: e.target.value })} />
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button style={{ ...S.primary, flex: 1, opacity: valid && !busy ? 1 : 0.5 }} disabled={!valid || busy} onClick={onSubmit}>
+            {busy ? "Ukládám…" : "Zaznamenat"}
+          </button>
+          <button style={S.ghost} onClick={onCancel}>Zrušit</button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -926,7 +1012,8 @@ const S = {
   batchRow: { display: "flex", justifyContent: "space-between", fontFamily: mono, fontSize: 13, color: "var(--ink)", padding: "5px 8px", background: "#fff", borderRadius: 7, marginBottom: 5 },
   batchBy: { color: "var(--sub)" },
 
-  suggest: { background: "var(--accent)", color: "var(--ink)", borderRadius: 11, padding: "12px 14px", fontSize: 14.5, marginBottom: 14, lineHeight: 1.5 },
+  suggest: { background: "var(--accent)", color: "var(--ink)", borderRadius: 11, padding: "12px 14px", fontSize: 14.5, marginBottom: 14, lineHeight: 1.5, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
+  suggestBtn: { flex: "0 0 auto", background: "var(--ink)", color: "var(--paper)", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 13, fontWeight: 700 },
   balList: { display: "flex", flexDirection: "column", gap: 3 },
   balRow: { display: "grid", gridTemplateColumns: "72px 1fr 82px", alignItems: "center", gap: 8, padding: "7px 4px" },
   balMe: { background: "rgba(31,79,216,.06)", borderRadius: 8 },
