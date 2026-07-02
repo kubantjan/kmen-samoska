@@ -48,6 +48,27 @@ async function lookupEAN(ean) {
   return null;
 }
 
+// ── Rohlík — aktuální cena podle názvu (jen orientační) ─────
+// Neoficiální endpoint, ale posílá CORS `*`, takže jde volat z prohlížeče.
+async function lookupRohlik(query) {
+  const q = (query || "").trim();
+  if (q.length < 2) return null;
+  try {
+    const r = await fetch(
+      `https://www.rohlik.cz/services/frontend-service/search-metadata?search=${encodeURIComponent(q)}&companyId=1`
+    );
+    const j = await r.json();
+    const p = j?.data?.productList?.[0];
+    if (!p || p.price?.full == null) return null;
+    return {
+      name: p.productName,
+      price: p.price.full,
+      amount: p.textualAmount || "",
+      link: p.baseLink ? `https://www.rohlik.cz/${p.baseLink}` : null,
+    };
+  } catch { return null; }
+}
+
 export default function App() {
   const [me, setMe] = useState(() => load("me", null));
   const [tab, setTab] = useState("shop");
@@ -267,6 +288,21 @@ function Shop({ stock, onStock, onTake }) {
 
 function StockForm({ draft, setDraft, onSave, onCancel }) {
   const valid = draft.name.trim() && Number(draft.price) > 0 && Number(draft.qty) > 0;
+  const [rohlik, setRohlik] = useState(null);
+  const [rohlikLoading, setRohlikLoading] = useState(false);
+
+  // Dotáhni orientační cenu z Rohlíku podle názvu (s malým zpožděním).
+  useEffect(() => {
+    const q = draft.name.trim();
+    if (q.length < 2) { setRohlik(null); setRohlikLoading(false); return; }
+    let live = true;
+    setRohlikLoading(true);
+    const t = setTimeout(() => {
+      lookupRohlik(q).then((r) => { if (live) { setRohlik(r); setRohlikLoading(false); } });
+    }, 500);
+    return () => { live = false; clearTimeout(t); };
+  }, [draft.name]);
+
   return (
     <section style={{ ...S.card, ...S.cardActive }}>
       <div style={S.cardTitle}>Naskladnění</div>
@@ -286,6 +322,25 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
             onChange={(e) => setDraft({ ...draft, price: e.target.value })} />
         </div>
       </div>
+
+      {rohlikLoading && !rohlik && <div style={S.rohlikMuted}>Hledám cenu na Rohlíku…</div>}
+      {rohlik && (
+        <div style={S.rohlik}>
+          <div style={S.rohlikTop}>
+            <span style={S.rohlikTag}>ROHLÍK</span>
+            <span style={S.rohlikName}>{rohlik.name}{rohlik.amount ? ` · ${rohlik.amount}` : ""}</span>
+          </div>
+          <div style={S.rohlikBottom}>
+            <span style={S.rohlikPrice}>{KC(rohlik.price)}</span>
+            <button type="button" style={S.rohlikUse}
+              onClick={() => setDraft({ ...draft, price: String(rohlik.price) })}>
+              Použít cenu
+            </button>
+          </div>
+          <div style={S.rohlikNote}>Orientační — cena, za kterou jsi to koupil, může být jiná.</div>
+        </div>
+      )}
+
       <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
         <button style={{ ...S.primary, opacity: valid ? 1 : 0.4 }} disabled={!valid}
           onClick={() => onSave({ ...draft, price: Number(draft.price), qty: Number(draft.qty) })}>
@@ -516,6 +571,16 @@ const S = {
   confirmPrice: { fontFamily: mono, fontSize: 34, fontWeight: 800, letterSpacing: -1 },
   confirmMeta: { fontSize: 13, color: "var(--sub)", marginTop: 10, lineHeight: 1.5 },
   confirmWarn: { color: "var(--neg)", fontWeight: 700, marginTop: 8 },
+
+  rohlikMuted: { fontFamily: mono, fontSize: 12, color: "var(--sub)", marginTop: 12 },
+  rohlik: { marginTop: 12, background: "#fff", border: "1px solid var(--line)", borderRadius: 12, padding: "11px 12px" },
+  rohlikTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 },
+  rohlikTag: { fontFamily: mono, fontSize: 10, fontWeight: 700, letterSpacing: 1, color: "#fff", background: "#00A56C", borderRadius: 5, padding: "2px 6px" },
+  rohlikName: { fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  rohlikBottom: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 },
+  rohlikPrice: { fontFamily: mono, fontSize: 18, fontWeight: 800, color: "var(--ink)" },
+  rohlikUse: { background: "#00A56C", color: "#fff", border: "none", borderRadius: 9, padding: "8px 12px", fontSize: 13, fontWeight: 700 },
+  rohlikNote: { fontSize: 11, color: "var(--sub)", marginTop: 8 },
   scanBox: { width: "100%", maxWidth: 460, background: "var(--ink)", borderRadius: 16, overflow: "hidden" },
   video: { width: "100%", height: 300, objectFit: "cover", display: "block", background: "#000" },
   scanFrame: { position: "absolute", top: "50%", left: "12%", right: "12%", height: 110, marginTop: -55, border: "2px solid var(--accent)", borderRadius: 10, pointerEvents: "none" },
