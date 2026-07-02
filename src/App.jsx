@@ -152,6 +152,23 @@ export default function App() {
     refetch();
   }
 
+  // Inventura: srovná stav skladu na napočítaná čísla (odpis `remaining`)
+  // a manko rozpočítá rovnoměrně mezi všechny členy (řádky v ledger).
+  async function commitInventura(updates, manko) {
+    for (const u of updates) {
+      await supabase.from("batches").update({ remaining: u.remaining }).eq("id", u.id);
+    }
+    const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
+    if (per !== 0) {
+      const at = Date.now();
+      const rows = MEMBERS.map((m) => ({
+        id: crypto.randomUUID(), ean: "__manko__", by: m, price: per, at,
+      }));
+      await supabase.from("ledger").insert(rows);
+    }
+    await refetch();
+  }
+
   if (!me) return <NamePicker onPick={setMe} />;
 
   return (
@@ -169,7 +186,7 @@ export default function App() {
       </header>
 
       <nav style={S.tabs}>
-        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"]].map(([k, label]) => (
+        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"], ["inv", "Inventura"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ ...S.tab, ...(tab === k ? S.tabOn : {}) }}>
             {label}
           </button>
@@ -180,6 +197,7 @@ export default function App() {
         {tab === "shop" && <Shop stock={stock} onStock={addBatch} onTake={take} />}
         {tab === "stock" && <Stock stock={stock} />}
         {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} />}
+        {tab === "inv" && <Inventura stock={stock} onCommit={commitInventura} />}
       </main>
 
       <footer style={S.footer}>
@@ -441,6 +459,118 @@ function Stock({ stock }) {
   );
 }
 
+function Inventura({ stock, onCommit }) {
+  const [counts, setCounts] = useState({});   // ean -> zadaný počet (string)
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);
+
+  // Napočítej manko + jaké šarže odepsat (odběr chybějících kusů = FIFO).
+  const { manko, updates } = useMemo(() => {
+    let manko = 0;
+    const updates = [];
+    for (const item of stock) {
+      const raw = counts[item.ean];
+      const target = raw === undefined || raw === "" ? item.qty : Math.max(0, Number(raw));
+      let diff = item.qty - target; // >0 chybí, <0 přebývá
+      const bs = item.batches.slice().sort((a, b) => a.at - b.at).map((b) => ({ id: b.id, left: b.left, price: b.price }));
+      if (diff > 0) {
+        let rem = diff;
+        for (const b of bs) {
+          if (rem <= 0) break;
+          const r = Math.min(rem, b.left);
+          manko += r * b.price;
+          rem -= r;
+          updates.push({ id: b.id, remaining: b.left - r });
+        }
+      } else if (diff < 0 && bs.length) {
+        const nb = bs[bs.length - 1]; // přebytek přičti k nejnovější šarži
+        const add = -diff;
+        manko -= add * nb.price;
+        updates.push({ id: nb.id, remaining: nb.left + add });
+      }
+    }
+    return { manko, updates };
+  }, [stock, counts]);
+
+  const bookValue = stock.reduce((s, x) => s + x.batches.reduce((t, b) => t + b.left * b.price, 0), 0);
+  const countedValue = bookValue - manko;
+  const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
+
+  async function commit() {
+    if (busy) return;
+    const msg = manko >= 0
+      ? `Zaúčtovat manko ${KC(manko)}? Každému z ${MEMBERS.length} přibude dluh ${KC(per)}. Nejde vzít zpět.`
+      : `Přebytek ${KC(-manko)} — každému připíšeme kredit ${KC(-per)}. Zaúčtovat? Nejde vzít zpět.`;
+    if (!window.confirm(msg)) return;
+    setBusy(true);
+    await onCommit(updates, manko);
+    setBusy(false);
+    setDone({ manko, per });
+    setCounts({});
+  }
+
+  if (stock.length === 0) {
+    return (
+      <section style={S.card}>
+        <div style={S.cardTitle}>Inventura</div>
+        <p style={S.empty}>Sklad je prázdný. Nejdřív naskladni věci (přes Naskladnit / Vzít), pak jde dělat inventuru.</p>
+      </section>
+    );
+  }
+
+  return (
+    <>
+      <section style={S.card}>
+        <div style={S.cardTitle}>Inventura — napočítej regál</div>
+        <p style={S.cardLead}>U každé věci zadej, kolik jich reálně je. Předvyplněno stavem z appky; přepiš jen rozdíly.</p>
+        {stock.map((item) => (
+          <div key={item.ean} style={S.invRow}>
+            <span style={S.invName}>{item.name}</span>
+            <span style={S.invBook}>app {item.qty}×</span>
+            <input
+              style={S.invInput}
+              type="number"
+              min="0"
+              inputMode="numeric"
+              value={counts[item.ean] ?? String(item.qty)}
+              onChange={(e) => setCounts((c) => ({ ...c, [item.ean]: e.target.value }))}
+            />
+          </div>
+        ))}
+      </section>
+
+      <section style={{ ...S.card, ...S.cardActive }}>
+        <div style={S.cardTitle}>Výsledek</div>
+        <div style={S.invSum}>
+          <div style={S.invSumRow}><span>Hodnota dle appky</span><b>{KC(bookValue)}</b></div>
+          <div style={S.invSumRow}><span>Napočítáno</span><b>{KC(countedValue)}</b></div>
+          <div style={S.invSumRow}>
+            <span>{manko >= 0 ? "Manko (chybí)" : "Přebytek"}</span>
+            <b style={{ color: manko >= 0 ? "var(--neg)" : "var(--pos)" }}>{KC(Math.abs(manko))}</b>
+          </div>
+          <div style={S.invSumRow}>
+            <span>Na osobu ({MEMBERS.length})</span>
+            <b style={{ color: manko >= 0 ? "var(--neg)" : "var(--pos)" }}>{KC(Math.abs(per))}</b>
+          </div>
+        </div>
+        <p style={S.hint}>
+          {manko >= 0
+            ? "Manko rozpočítáme jako dluh každému z členů rovným dílem."
+            : "Přebytek připíšeme každému jako kredit rovným dílem."}
+        </p>
+        <button style={{ ...S.primary, opacity: busy ? 0.5 : 1, width: "100%" }} disabled={busy} onClick={commit}>
+          {busy ? "Účtuju…" : (manko === 0 ? "Sklad sedí — srovnat" : `Zaúčtovat ${KC(Math.abs(manko))}`)}
+        </button>
+        {done && (
+          <div style={S.invDone}>
+            Hotovo — zaúčtováno {KC(Math.abs(done.manko))} ({KC(Math.abs(done.per))}/os).
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
 function Balance({ balances, suggestion, me }) {
   const max = Math.max(1, ...balances.map((b) => Math.abs(b.amount)));
   return (
@@ -598,8 +728,8 @@ const S = {
   wordmarkBig: { fontSize: 54, fontWeight: 800, letterSpacing: -2, lineHeight: 1, margin: "6px 0" },
   mePill: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: "7px 12px", color: "var(--ink)" },
 
-  tabs: { display: "flex", gap: 6, padding: "0 14px", borderBottom: "1px solid var(--line)" },
-  tab: { flex: 1, padding: "12px 4px", background: "none", border: "none", borderBottom: "3px solid transparent", color: "var(--sub)", fontSize: 14, fontWeight: 600 },
+  tabs: { display: "flex", gap: 4, padding: "0 12px", borderBottom: "1px solid var(--line)", overflowX: "auto" },
+  tab: { flex: "0 0 auto", padding: "12px 10px", background: "none", border: "none", borderBottom: "3px solid transparent", color: "var(--sub)", fontSize: 14, fontWeight: 600, whiteSpace: "nowrap" },
   tabOn: { color: "var(--brand-ink)", borderBottom: "3px solid var(--brand)" },
 
   main: { flex: 1, padding: 14, display: "flex", flexDirection: "column", gap: 14 },
@@ -625,6 +755,14 @@ const S = {
   takePrice: { fontFamily: mono, fontSize: 14, fontWeight: 700, color: "var(--brand-ink)" },
   hint: { fontSize: 12, color: "var(--sub)", margin: "12px 0 0", lineHeight: 1.4 },
   empty: { fontSize: 13.5, color: "var(--sub)", textAlign: "center", padding: "18px 0", lineHeight: 1.5 },
+
+  invRow: { display: "grid", gridTemplateColumns: "1fr auto 84px", alignItems: "center", gap: 10, padding: "9px 2px", borderTop: "1px solid var(--line)" },
+  invName: { fontSize: 14.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  invBook: { fontFamily: mono, fontSize: 12, color: "var(--sub)" },
+  invInput: { width: "100%", padding: "9px 10px", fontSize: 15, border: "1px solid var(--line)", borderRadius: 9, background: "#fff", fontFamily: mono, textAlign: "center" },
+  invSum: { display: "flex", flexDirection: "column", gap: 6, margin: "6px 0 4px" },
+  invSumRow: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 14 },
+  invDone: { marginTop: 12, background: "rgba(31,122,77,.1)", color: "var(--pos)", borderRadius: 10, padding: "10px 12px", fontSize: 13.5, fontWeight: 600 },
 
   stockTotal: { fontFamily: mono, fontSize: 13, color: "var(--sub)", marginBottom: 12 },
   stockItem: { borderTop: "1px solid var(--line)", padding: "2px 0" },
