@@ -20,6 +20,12 @@ Model je společný měšec (jako SettleUp):
 - **Čárové kódy** — scan EANu kamerou (ZXing, funguje Android i iOS).
   Lookup názvu z Open Food Facts; když produkt není, zadá se ručně a app si
   ho podle EANu zapamatuje.
+- **Lidi** — členové jsou ve sdílené DB (tabulka `members`), spravují se
+  v appce (záložka „Lidi"), nic není napevno v kódu. Tři stavy: *člen*
+  (počítá se saldo i rozpočítání manka), *host* (má saldo, ale manko se mezi
+  hosty nedělí), *schovaný/bývalý* (`archived` — k dnešku už nefiguruje,
+  historie zůstává, jde vrátit). `VITE_MEMBERS` je už jen prvotní seed prázdné
+  tabulky. Schéma: `db/members.sql`.
 
 ## Stack
 
@@ -33,7 +39,9 @@ Model je společný měšec (jako SettleUp):
 
 1. **`vite.config.js`** — `base` musí být `"/<nazev-repa>/"` (GitHub Pages
    servíruje z podadresáře). Teď je `"/samoska/"`.
-2. **`src/App.jsx`** — pole `MEMBERS` nahoře přepiš na reálných 11 jmen.
+2. **Členové** — v Supabase spusť `db/members.sql`. Jména buď rovnou přidej
+   v appce (záložka „Lidi"), nebo předvyplň `VITE_MEMBERS` v `.env` (nasype se
+   do prázdné tabulky při prvním spuštění).
 3. V GitHubu: Settings → Pages → Source = **GitHub Actions**.
 4. Push do `main` → workflow buildne a nasadí. URL bude
    `https://<user>.github.io/<repo>/`.

@@ -14,11 +14,21 @@ const supabase = createClient(
   import.meta.env.VITE_SUPABASE_ANON_KEY
 );
 
-// Členy nastav v `.env` přes VITE_MEMBERS (čárkou oddělená jména).
-const MEMBERS = (import.meta.env.VITE_MEMBERS || "")
+// Členové žijí ve sdílené DB (tabulka `members`) — přidávají/schovávají se
+// přímo v appce, nic není napevno v kódu. `VITE_MEMBERS` slouží už jen jako
+// prvotní naplnění (seed), když je tabulka úplně prázdná.
+const MEMBERS_ENV = (import.meta.env.VITE_MEMBERS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// Setřídění členů: podle `sort` (pořadí ze seedu / přidání), pak podle jména.
+const sortMembers = (list) =>
+  list.slice().sort((a, b) => {
+    const sa = a.sort ?? Number.MAX_SAFE_INTEGER;
+    const sb = b.sort ?? Number.MAX_SAFE_INTEGER;
+    return sa !== sb ? sa - sb : a.name.localeCompare(b.name, "cs");
+  });
 
 const KC = (n) =>
   new Intl.NumberFormat("cs-CZ", { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(n) + " Kč";
@@ -82,31 +92,64 @@ export default function App() {
   const [products, setProducts] = useState({});
   const [batches, setBatches] = useState([]);
   const [ledger, setLedger] = useState([]);
+  const [members, setMembers] = useState([]);
 
   useEffect(() => save("me", me), [me]);
 
   // Načti sdílený stav z Supabase (DB sloupec `remaining` → v appce `left`).
   async function refetch() {
-    const [p, b, l] = await Promise.all([
+    const [p, b, l, m] = await Promise.all([
       supabase.from("products").select("*"),
       supabase.from("batches").select("*"),
       supabase.from("ledger").select("*"),
+      supabase.from("members").select("*"),
     ]);
     if (p.data) setProducts(Object.fromEntries(p.data.map((r) => [r.ean, { ean: r.ean, name: r.name }])));
     if (b.data) setBatches(b.data.map((r) => ({ id: r.id, ean: r.ean, by: r.by, qty: r.qty, left: r.remaining, price: Number(r.price), at: r.at })));
     if (l.data) setLedger(l.data.map((r) => ({ id: r.id, ean: r.ean, by: r.by, price: Number(r.price), at: r.at })));
+    if (m.data) setMembers(m.data.map((r) => ({ name: r.name, guest: !!r.guest, archived: !!r.archived, sort: r.sort ?? null })));
+    return { members: m.data || [] };
   }
 
   useEffect(() => {
-    refetch();
+    (async () => {
+      const { members: mem } = await refetch();
+      // Prvotní naplnění: prázdná tabulka + jména v .env → nasypej je jako členy.
+      if (mem.length === 0 && MEMBERS_ENV.length) {
+        const rows = MEMBERS_ENV.map((name, i) => ({ name, guest: false, archived: false, sort: i, at: Date.now() }));
+        await supabase.from("members").upsert(rows);
+        refetch();
+      }
+    })();
     const ch = supabase
       .channel("samoska")
       .on("postgres_changes", { event: "*", schema: "public", table: "products" }, refetch)
       .on("postgres_changes", { event: "*", schema: "public", table: "batches" }, refetch)
       .on("postgres_changes", { event: "*", schema: "public", table: "ledger" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "members" }, refetch)
       .subscribe();
     return () => { supabase.removeChannel(ch); };
   }, []);
+
+  // ── Odvozené seznamy členů ──────────────────────────────────
+  // active = viditelní teď (nezarchivovaní); guest = host (viditelný člověk,
+  // ale nepodílí se na rozpočítání manka). splitNames = jádro, mezi které se
+  // manko/přebytek dělí (aktivní ne-hosté).
+  const activeMembers = useMemo(() => sortMembers(members.filter((m) => !m.archived)), [members]);
+  const activeNames = useMemo(() => activeMembers.map((m) => m.name), [activeMembers]);
+  const splitNames = useMemo(
+    () => sortMembers(members.filter((m) => !m.archived && !m.guest)).map((m) => m.name),
+    [members]
+  );
+
+  // Jména, která mají nějakou historii (naskladnění/odběr/platba) — takové
+  // nejde natvrdo smazat, jen schovat (archivovat).
+  const activeSet = useMemo(() => {
+    const s = new Set();
+    for (const b of batches) s.add(b.by);
+    for (const l of ledger) s.add(l.by);
+    return s;
+  }, [batches, ledger]);
 
   const stock = useMemo(() => {
     const map = {};
@@ -119,19 +162,31 @@ export default function App() {
     return Object.values(map).sort((a, b) => a.name.localeCompare(b.name, "cs"));
   }, [batches, products]);
 
+  // Salda počítáme jen pro známé členy (včetně hostů a archivovaných — ti si
+  // svoje saldo nesou dál, dokud se nevyrovná). `by` jako `__inventura__`
+  // (neutrální zboží) není člen, takže se do salda nepropíše.
   const balances = useMemo(() => {
-    const bal = Object.fromEntries(MEMBERS.map((m) => [m, 0]));
+    const bal = Object.fromEntries(members.map((m) => [m.name, 0]));
     for (const b of batches) if (bal[b.by] !== undefined) bal[b.by] += b.qty * b.price;
     for (const l of ledger) if (bal[l.by] !== undefined) bal[l.by] -= l.price;
-    return MEMBERS.map((m) => ({ name: m, amount: bal[m] })).sort((a, b) => b.amount - a.amount);
-  }, [batches, ledger]);
+    return members
+      .map((m) => ({ name: m.name, amount: bal[m.name], guest: m.guest, archived: m.archived }))
+      .sort((a, b) => b.amount - a.amount);
+  }, [batches, ledger, members]);
+
+  // Do návrhu převodu i zobrazení bereme viditelná salda: aktivní členy vždy,
+  // archivované jen když mají co dorovnat (nenulové saldo).
+  const visibleBalances = useMemo(
+    () => balances.filter((b) => !b.archived || Math.abs(b.amount) >= 0.005),
+    [balances]
+  );
 
   const suggestion = useMemo(() => {
-    const top = balances[0];
-    const bottom = balances[balances.length - 1];
+    const top = visibleBalances[0];
+    const bottom = visibleBalances[visibleBalances.length - 1];
     if (!top || !bottom || bottom.amount >= 0 || top.amount <= 0) return null;
     return { from: bottom.name, to: top.name, amount: Math.min(-bottom.amount, top.amount) };
-  }, [balances]);
+  }, [visibleBalances]);
 
   async function addBatch(ean, name, qty, price, by = me) {
     await supabase.from("products").upsert({ ean, name });
@@ -169,7 +224,8 @@ export default function App() {
   }
 
   // Inventura. `updates` = odpisy/přípisy `remaining` na napočítaná čísla.
-  // `manko` = Σ salda − hodnota skladu (rozpočítá se rovným dílem).
+  // `manko` = Σ salda − hodnota skladu. Rozpočítá se rovným dílem jen mezi
+  // jádro (aktivní ne-hosté) — hosti manko neabsorbují.
   // `targets` (onboarding) = mapa jméno→cílové saldo ze SettleUpu; když je
   // zadaná, nejdřív se app-salda posunou na tyhle hodnoty.
   async function commitInventura(updates, manko, targets = null) {
@@ -180,20 +236,38 @@ export default function App() {
     const rows = [];
     if (targets) {
       const cur = Object.fromEntries(balances.map((b) => [b.name, b.amount]));
-      for (const m of MEMBERS) {
+      for (const name of Object.keys(targets)) {
         // saldo se počítá jako Σnaskladnění − Σledger; ledger odčítá `price`,
         // takže posun na cíl = price (cur − target).
-        const delta = Math.round(((cur[m] || 0) - Number(targets[m] || 0)) * 100) / 100;
-        if (delta !== 0) rows.push({ id: crypto.randomUUID(), ean: "__settleup__", by: m, price: delta, at });
+        const delta = Math.round(((cur[name] || 0) - Number(targets[name] || 0)) * 100) / 100;
+        if (delta !== 0) rows.push({ id: crypto.randomUUID(), ean: "__settleup__", by: name, price: delta, at });
       }
     }
-    const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
-    if (per !== 0) for (const m of MEMBERS) rows.push({ id: crypto.randomUUID(), ean: "__manko__", by: m, price: per, at });
+    const per = Math.round((manko / (splitNames.length || 1)) * 100) / 100;
+    if (per !== 0) for (const name of splitNames) rows.push({ id: crypto.randomUUID(), ean: "__manko__", by: name, price: per, at });
     if (rows.length) await supabase.from("ledger").insert(rows);
     await refetch();
   }
 
-  if (!me) return <NamePicker onPick={setMe} />;
+  // ── Správa členů ────────────────────────────────────────────
+  async function addMember(name, guest = false) {
+    const n = (name || "").trim();
+    if (!n) return;
+    // sort = na konec seznamu (max dosavadní + 1)
+    const maxSort = members.reduce((mx, m) => (m.sort != null && m.sort > mx ? m.sort : mx), -1);
+    await supabase.from("members").upsert({ name: n, guest: !!guest, archived: false, sort: maxSort + 1, at: Date.now() });
+    await refetch();
+  }
+  async function updateMember(name, patch) {
+    await supabase.from("members").update(patch).eq("name", name);
+    await refetch();
+  }
+  async function deleteMember(name) {
+    await supabase.from("members").delete().eq("name", name);
+    await refetch();
+  }
+
+  if (!me) return <NamePicker members={activeMembers} onPick={setMe} />;
 
   return (
     <div style={S.wrap}>
@@ -210,7 +284,7 @@ export default function App() {
       </header>
 
       <nav style={S.tabs}>
-        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"], ["hist", "Historie"], ["inv", "Inventura"]].map(([k, label]) => (
+        {[["shop", "Naskladnit / Vzít"], ["stock", "Sklad"], ["balance", "Kdo komu"], ["hist", "Historie"], ["inv", "Inventura"], ["people", "Lidi"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ ...S.tab, ...(tab === k ? S.tabOn : {}) }}>
             {label}
           </button>
@@ -220,9 +294,10 @@ export default function App() {
       <main style={S.main}>
         {tab === "shop" && <Shop stock={stock} onStock={addBatch} onTake={take} />}
         {tab === "stock" && <Stock stock={stock} />}
-        {tab === "balance" && <Balance balances={balances} suggestion={suggestion} me={me} onPay={recordPayment} />}
+        {tab === "balance" && <Balance balances={visibleBalances} suggestion={suggestion} me={me} names={activeNames} onPay={recordPayment} />}
         {tab === "hist" && <History batches={batches} ledger={ledger} products={products} />}
-        {tab === "inv" && <Inventura stock={stock} balances={balances} onStock={addBatch} onCommit={commitInventura} />}
+        {tab === "inv" && <Inventura stock={stock} balances={balances} listMembers={activeMembers} splitCount={splitNames.length} onStock={addBatch} onCommit={commitInventura} />}
+        {tab === "people" && <People members={members} balances={balances} activeSet={activeSet} me={me} onAdd={addMember} onUpdate={updateMember} onDelete={deleteMember} />}
       </main>
 
       <footer style={S.footer}>
@@ -232,7 +307,9 @@ export default function App() {
   );
 }
 
-function NamePicker({ onPick }) {
+function NamePicker({ members, onPick }) {
+  const people = members.filter((m) => !m.guest);
+  const guests = members.filter((m) => m.guest);
   return (
     <div style={S.wrap}>
       <style>{CSS}</style>
@@ -241,11 +318,29 @@ function NamePicker({ onPick }) {
         <div style={S.wordmarkBig}>SAMOŠKA</div>
         <p style={S.pickerLead}>Kdo jsi? Klepni na svoje jméno.</p>
       </div>
-      <div style={S.nameGrid}>
-        {MEMBERS.map((m) => (
-          <button key={m} style={S.nameTile} onClick={() => onPick(m)}>{m}</button>
-        ))}
-      </div>
+      {members.length === 0 ? (
+        <p style={{ ...S.empty, padding: "0 22px 30px" }}>
+          Zatím tu nikdo není. Přidej lidi v záložce „Lidi" (kdokoliv po výběru jména).
+        </p>
+      ) : (
+        <>
+          <div style={S.nameGrid}>
+            {people.map((m) => (
+              <button key={m.name} style={S.nameTile} onClick={() => onPick(m.name)}>{m.name}</button>
+            ))}
+          </div>
+          {guests.length > 0 && (
+            <>
+              <div style={S.pickerGuestHead}>Hosté</div>
+              <div style={S.nameGrid}>
+                {guests.map((m) => (
+                  <button key={m.name} style={{ ...S.nameTile, ...S.nameTileGuest }} onClick={() => onPick(m.name)}>{m.name}</button>
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -576,7 +671,7 @@ function History({ batches, ledger, products }) {
   );
 }
 
-function Inventura({ stock, balances, onStock, onCommit }) {
+function Inventura({ stock, balances, listMembers, splitCount, onStock, onCommit }) {
   const [counts, setCounts] = useState({});   // ean -> napočítaný počet (string)
   const [mode, setMode] = useState("app");     // "app" (opakovaná) | "manual" (onboarding)
   const [manualVals, setManualVals] = useState({}); // jméno -> saldo (string)
@@ -623,11 +718,11 @@ function Inventura({ stock, balances, onStock, onCommit }) {
     return raw === undefined || raw === "" ? (curBal[m] || 0) : Number(raw);
   };
   const B = mode === "manual"
-    ? MEMBERS.reduce((s, m) => s + getVal(m), 0)
+    ? listMembers.reduce((s, m) => s + getVal(m.name), 0)
     : balances.reduce((s, b) => s + b.amount, 0);
 
   const manko = Math.round((B - countedValue) * 100) / 100;
-  const per = Math.round((manko / (MEMBERS.length || 1)) * 100) / 100;
+  const per = Math.round((manko / (splitCount || 1)) * 100) / 100;
 
   function onScanned(ean) {
     setScanMode(false);
@@ -640,11 +735,11 @@ function Inventura({ stock, balances, onStock, onCommit }) {
   async function commit() {
     if (busy) return;
     const msg = manko >= 0
-      ? `Zaúčtovat manko ${KC(manko)}? Každému z ${MEMBERS.length} přibude dluh ${KC(per)}.${mode === "manual" ? " Salda se nastaví na zadané." : ""} Nejde vzít zpět.`
+      ? `Zaúčtovat manko ${KC(manko)}? Každému z ${splitCount} přibude dluh ${KC(per)}.${mode === "manual" ? " Salda se nastaví na zadané." : ""} Nejde vzít zpět.`
       : `Přebytek ${KC(-manko)} — každému kredit ${KC(-per)}.${mode === "manual" ? " Salda se nastaví na zadané." : ""} Zaúčtovat? Nejde vzít zpět.`;
     if (!window.confirm(msg)) return;
     setBusy(true);
-    const targets = mode === "manual" ? Object.fromEntries(MEMBERS.map((m) => [m, getVal(m)])) : null;
+    const targets = mode === "manual" ? Object.fromEntries(listMembers.map((m) => [m.name, getVal(m.name)])) : null;
     await onCommit(updates, manko, targets);
     setBusy(false);
     setDone({ manko, per });
@@ -686,23 +781,26 @@ function Inventura({ stock, balances, onStock, onCommit }) {
             ? "Vezmou se aktuální salda z appky (opakovaná inventura)."
             : "Vyplň aktuální salda ze SettleUpu. + = samoška dluží jemu, − = on dluží samošce."}
         </p>
-        {MEMBERS.map((m) => (
-          <div key={m} style={S.invRow}>
-            <span style={S.invName}>{m}</span>
+        {listMembers.map((m) => (
+          <div key={m.name} style={S.invRow}>
+            <span style={S.invName}>{m.name}{m.guest && <span style={S.guestTag}>host</span>}</span>
             {mode === "app" ? (
-              <span style={{ ...S.balAmt, gridColumn: "2 / 4", color: (curBal[m] || 0) >= 0 ? "var(--pos)" : "var(--neg)" }}>
-                {(curBal[m] || 0) >= 0 ? "+" : ""}{KC(curBal[m] || 0)}
+              <span style={{ ...S.balAmt, gridColumn: "2 / 4", color: (curBal[m.name] || 0) >= 0 ? "var(--pos)" : "var(--neg)" }}>
+                {(curBal[m.name] || 0) >= 0 ? "+" : ""}{KC(curBal[m.name] || 0)}
               </span>
             ) : (
               <input
                 style={{ ...S.invInput, gridColumn: "2 / 4", textAlign: "right" }}
                 type="number" step="0.01" inputMode="decimal"
-                value={manualVals[m] ?? String(curBal[m] || 0)}
-                onChange={(e) => setManualVals((v) => ({ ...v, [m]: e.target.value }))}
+                value={manualVals[m.name] ?? String(curBal[m.name] || 0)}
+                onChange={(e) => setManualVals((v) => ({ ...v, [m.name]: e.target.value }))}
               />
             )}
           </div>
         ))}
+        {splitCount < listMembers.length && (
+          <p style={S.hint}>Hosté mají svoje saldo, ale manko se dělí jen mezi {splitCount} členů (ne mezi hosty).</p>
+        )}
       </section>
 
       <section style={{ ...S.card, ...S.cardActive }}>
@@ -715,7 +813,7 @@ function Inventura({ stock, balances, onStock, onCommit }) {
             <b style={{ color: manko >= 0 ? "var(--neg)" : "var(--pos)" }}>{KC(Math.abs(manko))}</b>
           </div>
           <div style={S.invSumRow}>
-            <span>Na osobu ({MEMBERS.length})</span>
+            <span>Na osobu ({splitCount})</span>
             <b style={{ color: manko >= 0 ? "var(--neg)" : "var(--pos)" }}>{KC(Math.abs(per))}</b>
           </div>
         </div>
@@ -745,7 +843,7 @@ function Inventura({ stock, balances, onStock, onCommit }) {
   );
 }
 
-function Balance({ balances, suggestion, me, onPay }) {
+function Balance({ balances, suggestion, me, names, onPay }) {
   const max = Math.max(1, ...balances.map((b) => Math.abs(b.amount)));
   const [pay, setPay] = useState(null); // {from, to, amount} formulář platby
   const [busy, setBusy] = useState(false);
@@ -770,7 +868,11 @@ function Balance({ balances, suggestion, me, onPay }) {
           const pos = b.amount >= 0;
           return (
             <div key={b.name} style={{ ...S.balRow, ...(b.name === me ? S.balMe : {}) }}>
-              <span style={S.balName}>{b.name}{b.name === me ? " (ty)" : ""}</span>
+              <span style={S.balName}>
+                {b.name}{b.name === me ? " (ty)" : ""}
+                {b.guest && <span style={S.guestTag}>host</span>}
+                {b.archived && <span style={S.formerTag}>bývalý</span>}
+              </span>
               <div style={S.balBarWrap}>
                 <div style={{ ...S.balBar, width: `${(Math.abs(b.amount) / max) * 50}%`, background: pos ? "var(--pos)" : "var(--neg)", left: pos ? "50%" : "auto", right: pos ? "auto" : "50%" }} />
                 <div style={S.balMid} />
@@ -787,7 +889,7 @@ function Balance({ balances, suggestion, me, onPay }) {
 
       {pay && (
         <PayForm
-          pay={pay} setPay={setPay} busy={busy}
+          pay={pay} setPay={setPay} busy={busy} names={names}
           onSubmit={async () => {
             if (busy) return;
             setBusy(true);
@@ -802,8 +904,11 @@ function Balance({ balances, suggestion, me, onPay }) {
   );
 }
 
-function PayForm({ pay, setPay, onSubmit, onCancel, busy }) {
+function PayForm({ pay, setPay, onSubmit, onCancel, busy, names }) {
   const valid = pay.from && pay.to && pay.from !== pay.to && Number(pay.amount) > 0;
+  // Ve výběru ukaž aktivní lidi + kohokoliv, kdo je součástí téhle platby
+  // (např. bývalý člen, kterého dorovnáváme).
+  const opts = Array.from(new Set([...names, pay.from, pay.to].filter(Boolean)));
   return (
     <div style={S.formOverlay} onClick={onCancel}>
       <section style={{ ...S.card, ...S.cardActive, ...S.formBox }} onClick={(e) => e.stopPropagation()}>
@@ -814,14 +919,14 @@ function PayForm({ pay, setPay, onSubmit, onCancel, busy }) {
             <label style={S.label}>Od koho</label>
             <select style={S.input} value={pay.from} onChange={(e) => setPay({ ...pay, from: e.target.value })}>
               <option value="">—</option>
-              {MEMBERS.map((m) => <option key={m} value={m}>{m}</option>)}
+              {opts.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </div>
           <div style={{ flex: 1 }}>
             <label style={S.label}>Komu</label>
             <select style={S.input} value={pay.to} onChange={(e) => setPay({ ...pay, to: e.target.value })}>
               <option value="">—</option>
-              {MEMBERS.map((m) => <option key={m} value={m}>{m}</option>)}
+              {opts.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </div>
         </div>
@@ -836,6 +941,123 @@ function PayForm({ pay, setPay, onSubmit, onCancel, busy }) {
         </div>
       </section>
     </div>
+  );
+}
+
+// ── Správa lidí ─────────────────────────────────────────────
+// Členové, hosté (viditelní, ale nedělí se s nimi manko) a skrytí/bývalí
+// (archivovaní k dnešku — už nefigurují, historie zůstává).
+function People({ members, balances, activeSet, me, onAdd, onUpdate, onDelete }) {
+  const [name, setName] = useState("");
+  const [guest, setGuest] = useState(false);
+
+  const balOf = Object.fromEntries(balances.map((b) => [b.name, b.amount]));
+  const sorted = sortMembers(members);
+  const coreMembers = sorted.filter((m) => !m.archived && !m.guest);
+  const guests = sorted.filter((m) => !m.archived && m.guest);
+  const archived = sorted.filter((m) => m.archived);
+  const exists = (n) => members.some((m) => m.name.toLowerCase() === n.trim().toLowerCase());
+
+  function add() {
+    const n = name.trim();
+    if (!n) return;
+    if (exists(n)) { alert("Někdo s tímhle jménem už tu je."); return; }
+    onAdd(n, guest);
+    setName(""); setGuest(false);
+  }
+
+  function archive(m) {
+    const bal = balOf[m.name] || 0;
+    const warn = Math.abs(bal) >= 0.005
+      ? `${m.name} má nevyrovnané saldo ${bal >= 0 ? "+" : ""}${KC(bal)}. Doporučujeme ho nejdřív dorovnat platbou nebo inventurou. Přesto schovat?`
+      : `Schovat ${m.name}? Přestane se nabízet a nebude figurovat v rozpočítávání. Historie zůstane, jde vrátit zpět.`;
+    if (window.confirm(warn)) onUpdate(m.name, { archived: true });
+  }
+
+  function remove(m) {
+    if (window.confirm(`Nadobro smazat ${m.name}? Nemá žádnou historii, takže po něm nic nezůstane.`)) onDelete(m.name);
+  }
+
+  function row(m, { restore } = {}) {
+    const bal = balOf[m.name] || 0;
+    const nonzero = Math.abs(bal) >= 0.005;
+    const hasHist = activeSet.has(m.name);
+    return (
+      <div key={m.name} style={S.peopleRow}>
+        <div style={S.peopleMain}>
+          <span style={S.peopleName}>
+            {m.name}{m.name === me ? " (ty)" : ""}
+            {m.guest && <span style={S.guestTag}>host</span>}
+          </span>
+          <span style={{ ...S.peopleBal, color: bal >= 0 ? "var(--pos)" : "var(--neg)" }}>
+            {nonzero ? `${bal >= 0 ? "+" : ""}${KC(bal)}` : "vyrovnáno"}
+          </span>
+        </div>
+        <div style={S.peopleActions}>
+          {restore ? (
+            <>
+              <button style={S.peopleBtn} onClick={() => onUpdate(m.name, { archived: false })}>Vrátit</button>
+              {!hasHist && !nonzero && (
+                <button style={{ ...S.peopleBtn, ...S.peopleBtnDanger }} onClick={() => remove(m)}>Smazat</button>
+              )}
+            </>
+          ) : (
+            <>
+              <button style={S.peopleBtn} onClick={() => onUpdate(m.name, { guest: !m.guest })}>
+                {m.guest ? "Udělat členem" : "Udělat hostem"}
+              </button>
+              <button style={S.peopleBtn} onClick={() => archive(m)}>Schovat</button>
+              {!hasHist && !nonzero && (
+                <button style={{ ...S.peopleBtn, ...S.peopleBtnDanger }} onClick={() => remove(m)}>Smazat</button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <section style={S.card}>
+        <div style={S.cardTitle}>Přidat člověka</div>
+        <p style={S.cardLead}>Nový člen, nebo host (host se nabízí i počítá salda, ale nerozpočítává se mu manko).</p>
+        <input style={S.input} value={name} placeholder="Jméno"
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+        <label style={S.checkRow}>
+          <input type="checkbox" checked={guest} onChange={(e) => setGuest(e.target.checked)} />
+          <span>Je to host</span>
+        </label>
+        <button style={{ ...S.primary, width: "100%", marginTop: 12, opacity: name.trim() ? 1 : 0.4 }}
+          disabled={!name.trim()} onClick={add}>
+          Přidat {guest ? "hosta" : "člena"}
+        </button>
+      </section>
+
+      <section style={S.card}>
+        <div style={S.cardTitle}>Členové ({coreMembers.length})</div>
+        {coreMembers.length === 0
+          ? <p style={S.empty}>Zatím žádní členové.</p>
+          : coreMembers.map((m) => row(m))}
+      </section>
+
+      {guests.length > 0 && (
+        <section style={S.card}>
+          <div style={S.cardTitle}>Hosté ({guests.length})</div>
+          <p style={S.cardLead}>Berou a naskladňují jako ostatní, ale manko/přebytek se mezi ně nedělí.</p>
+          {guests.map((m) => row(m))}
+        </section>
+      )}
+
+      {archived.length > 0 && (
+        <section style={S.card}>
+          <div style={S.cardTitle}>Skrytí / bývalí ({archived.length})</div>
+          <p style={S.cardLead}>Už nefigurují v samošce. Historie zůstává. Nenulové saldo je dobré dorovnat.</p>
+          {archived.map((m) => row(m, { restore: true }))}
+        </section>
+      )}
+    </>
   );
 }
 
@@ -1032,8 +1254,22 @@ const S = {
 
   pickerHero: { padding: "40px 22px 20px", textAlign: "center" },
   pickerLead: { fontSize: 15, color: "var(--sub)", marginTop: 10 },
+  pickerGuestHead: { fontFamily: mono, fontSize: 11, letterSpacing: 2, color: "var(--sub)", textTransform: "uppercase", padding: "4px 20px 8px" },
   nameGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, padding: "0 18px 30px" },
   nameTile: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: "22px 10px", fontSize: 17, fontWeight: 700, color: "var(--ink)" },
+  nameTileGuest: { background: "#fff", borderStyle: "dashed", fontWeight: 600 },
+
+  guestTag: { fontFamily: mono, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "var(--brand-ink)", background: "rgba(31,79,216,.1)", borderRadius: 5, padding: "1px 5px", marginLeft: 6, verticalAlign: "middle" },
+  formerTag: { fontFamily: mono, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "var(--sub)", background: "var(--line)", borderRadius: 5, padding: "1px 5px", marginLeft: 6, verticalAlign: "middle" },
+  checkRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 14, marginTop: 12, color: "var(--ink)" },
+
+  peopleRow: { display: "flex", flexDirection: "column", gap: 8, padding: "12px 2px", borderTop: "1px solid var(--line)" },
+  peopleMain: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
+  peopleName: { fontSize: 15, fontWeight: 600 },
+  peopleBal: { fontFamily: mono, fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" },
+  peopleActions: { display: "flex", gap: 8, flexWrap: "wrap" },
+  peopleBtn: { background: "#fff", color: "var(--brand-ink)", border: "1px solid var(--line)", borderRadius: 9, padding: "7px 12px", fontSize: 13, fontWeight: 600 },
+  peopleBtnDanger: { color: "var(--neg)" },
 
   scanOverlay: { position: "fixed", inset: 0, background: "rgba(20,18,14,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 },
 

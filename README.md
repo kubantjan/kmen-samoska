@@ -21,8 +21,18 @@ Otevři `http://localhost:5173`. Kamera (scan kódů) potřebuje HTTPS nebo
 
 ## Přizpůsobení
 
-- Jména členů: pole `MEMBERS` v `src/App.jsx`.
-- Data se ukládají do `localStorage` (jen v daném telefonu). Sdílený stav
-  vyžaduje backend — viz `CLAUDE.md`, sekce backlog.
+- **Lidi** se spravují přímo v appce (záložka „Lidi") — přidání, host,
+  schování. Nic není napevno v kódu.
+  - **Člen** — normální člověk, počítá se mu saldo i se s ním rozpočítává
+    manko z inventury.
+  - **Host** — je vidět a má saldo, ale manko/přebytek z inventury se mezi
+    hosty **nedělí**.
+  - **Schovaný / bývalý** — k dnešku se schová: přestane se nabízet a
+    nefiguruje v rozpočítávání. Historie zůstává, jde vrátit zpět.
+  - Tabulku v Supabase založ jednou přes `db/members.sql`.
+  - `VITE_MEMBERS` v `.env` slouží už jen jako **prvotní naplnění** —
+    appka jména nasype do DB, jen když je tabulka členů prázdná.
+- Sdílený stav běží přes Supabase (viz `CLAUDE.md`). Identita „kdo jsem"
+  zůstává lokální v telefonu (`localStorage`).
 
 Podrobnější kontext v [`CLAUDE.md`](./CLAUDE.md).
