@@ -260,7 +260,7 @@ function Shop({ stock, onStock, onTake }) {
         <button style={{ ...S.ghost, marginBottom: 12 }} onClick={() => setScanMode("take")}>
           📷 Skenovat &amp; vzít
         </button>
-        {stock.length > 2 && (
+        {stock.length > 0 && (
           <SearchBox q={q} setQ={setQ} count={filtered.length} />
         )}
         {stock.length === 0 ? (
@@ -392,7 +392,7 @@ function Stock({ stock }) {
     <section style={S.card}>
       <div style={S.cardTitle}>Co je teď v samošce</div>
       <div style={S.stockTotal}>Hodnota skladu <b>{KC(total)}</b></div>
-      {stock.length > 2 && <SearchBox q={q} setQ={setQ} count={filtered.length} />}
+      {stock.length > 0 && <SearchBox q={q} setQ={setQ} count={filtered.length} />}
       {stock.length === 0 ? (
         <p style={S.empty}>Prázdno. Až něco přikoupíte, uvidíte to tady.</p>
       ) : filtered.length === 0 ? (
