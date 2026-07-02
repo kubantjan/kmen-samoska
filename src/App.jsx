@@ -334,7 +334,8 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
   }
 
   return (
-    <section style={{ ...S.card, ...S.cardActive }}>
+    <div style={S.formOverlay} onClick={onCancel}>
+    <section style={{ ...S.card, ...S.cardActive, ...S.formBox }} onClick={(e) => e.stopPropagation()}>
       <div style={S.cardTitle}>Naskladnění</div>
       {draft.ean && <div style={S.eanTag}>EAN {draft.ean}</div>}
       <label style={S.label}>Název — piš a vyber z Rohlíku (doplní název i cenu)</label>
@@ -380,6 +381,7 @@ function StockForm({ draft, setDraft, onSave, onCancel }) {
         <button style={S.ghost} onClick={onCancel}>Zrušit</button>
       </div>
     </section>
+    </div>
   );
 }
 
@@ -647,6 +649,9 @@ const S = {
   nameTile: { background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 14, padding: "22px 10px", fontSize: 17, fontWeight: 700, color: "var(--ink)" },
 
   scanOverlay: { position: "fixed", inset: 0, background: "rgba(20,18,14,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 },
+
+  formOverlay: { position: "fixed", inset: 0, background: "rgba(20,18,14,.72)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 60, padding: "20px 14px 40px", overflowY: "auto" },
+  formBox: { width: "100%", maxWidth: 520, margin: "auto" },
 
   confirmBox: { width: "100%", maxWidth: 420, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 18, padding: "22px 20px" },
   confirmKicker: { fontFamily: mono, fontSize: 11, letterSpacing: 2, color: "var(--sub)" },
