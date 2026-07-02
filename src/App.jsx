@@ -145,9 +145,10 @@ export default function App() {
   // nerozbijí `remaining` ani nevezmou stejný kus dvakrát. Víc kusů =
   // víc volání za sebou, každé sebere nejstarší dostupný kus.
   async function take(ean, count = 1) {
+    const at = Date.now(); // stejný čas pro celý odběr → v historii jeden řádek
     for (let i = 0; i < count; i++) {
       const { error } = await supabase.rpc("take_item", {
-        p_ean: ean, p_by: me, p_id: crypto.randomUUID(), p_at: Date.now(),
+        p_ean: ean, p_by: me, p_id: crypto.randomUUID(), p_at: at,
       });
       if (error) { alert("Nepovedlo se vzít: " + error.message); break; }
     }
@@ -512,7 +513,13 @@ function History({ batches, ledger, products }) {
       }
       if (l.price < 0) grouped[key].from = l.by; else { grouped[key].to = l.by; grouped[key].amount = l.price; }
     } else {
-      events.push({ at: l.at, kind: "take", who: l.by, name: nameOf(l.ean), amount: l.price });
+      // stejný člověk + stejná věc + stejný čas = jeden odběr (i víc kusů)
+      const key = "take@" + l.by + "@" + l.ean + "@" + l.at;
+      if (!grouped[key]) {
+        grouped[key] = { at: l.at, kind: "take", who: l.by, name: nameOf(l.ean), qty: 0, amount: 0 };
+        events.push(grouped[key]);
+      }
+      grouped[key].qty++; grouped[key].amount += l.price;
     }
   }
 
@@ -538,7 +545,7 @@ function History({ batches, ledger, products }) {
             amount = KC(e.amount);
           } else if (e.kind === "take") {
             icon = "−"; color = "var(--neg)";
-            text = <><b>{e.who}</b> vzal {e.name}</>;
+            text = <><b>{e.who}</b> vzal {e.qty > 1 ? e.qty + "× " : ""}{e.name}</>;
             amount = "−" + KC(e.amount);
           } else if (e.kind === "pay") {
             icon = "💸"; color = "var(--brand-ink)";
